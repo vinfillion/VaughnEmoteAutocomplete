@@ -1456,20 +1456,10 @@
     if (!dropdown) return;
     const q = getQuery();
     if (!q || !q.query) {
-      // ':' alone (or no trigger): show the full list so Tab/Enter still have
-      // suggestions, but only right after the trigger was typed — otherwise
-      // keep it hidden to avoid a popup covering the chat while editing.
-      if (q && !q.query && lastKeyWasColon) {
-        currentMatches = Array.from(emotes.values()).slice(0, MAX_SUGGESTIONS);
-        if (currentMatches.length) {
-          activeIndex = 0;
-          renderDropdown(currentMatches);
-          positionDropdown();
-          dropdown.style.display = 'block';
-          return;
-        }
-      }
-      return hideAutocomplete();   // need at least ":x" — ":" alone shows nothing
+      // Need at least ":x". A bare ":" shows nothing — previously this branch
+      // referenced an undeclared `lastKeyWasColon` variable (left over from an
+      // incomplete refactor), which threw ReferenceError on every keystroke.
+      return hideAutocomplete();
     }
     currentMatches = matchEmotes(q.query);
     if (currentMatches.length === 0) return hideAutocomplete();
