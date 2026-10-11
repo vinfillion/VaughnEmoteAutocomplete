@@ -215,6 +215,34 @@
     return null;
   }
 
+  // ---------- emote-item validation ----------
+  // Site chrome also uses [title] + clickable divs (e.g. trending stream
+  // entries like "thejedshed - winter approacheth! ~ live from Kansas City"
+  // with vs_v9_content_menu_item / ShowContentPreview onclicks). Those were
+  // being harvested as "emotes". Hard-exclude known non-emote containers,
+  // and require picker-like traits for anything that isn't a confirmed
+  // insertEmoji() element.
+  const NON_EMOTE_CLASS_RE = /content_menu|menu_item|stream|channel|profile|preview|viewer|indicator/i;
+  const NON_EMOTE_ONCLICK_RE = /ShowContentPreview|HideContentPreview|vs_core\.|navigate|switchChannel|follow/i;
+
+  function looksLikeEmoteItem(item, onclick) {
+    // Confirmed picker item if it inserts an emote on click.
+    if (/insertEmoji\s*\(/.test(onclick)) return true;
+    const cls = (typeof item.className === 'string' ? item.className : '') +
+                ' ' + (item.id || '');
+    if (NON_EMOTE_CLASS_RE.test(cls)) return false;
+    if (NON_EMOTE_ONCLICK_RE.test(onclick)) return false;
+    // Unconfirmed items must at least contain a small image, like every
+    // real emote does. Stream-menu rows contain big preview thumbnails and
+    // profile avatars instead.
+    const img = item.querySelector && item.querySelector('img');
+    if (!img) return false;
+    const w = parseInt(img.getAttribute('width'), 10) || img.naturalWidth || 0;
+    const h = parseInt(img.getAttribute('height'), 10) || img.naturalHeight || 0;
+    if (w > 128 || h > 128) return false; // large media -> not an emote icon
+    return true;
+  }
+
   // Generic parser: given a NodeList of candidate emoji-item elements,
   // extract {id, name, ...} from title + onclick, whatever the exact
   // class name or attribute order happens to be.
@@ -223,6 +251,7 @@
       const title = item.getAttribute('title') || '';
       // onclick may be an attribute OR a property set by JS (no attribute)
       const onclick = item.getAttribute('onclick') || String(item.onclick || '');
+      if (!looksLikeEmoteItem(item, onclick)) return null;
       const idMatch = onclick.match(/insertEmoji\(\s*['"]([^'"]+)['"]\s*,/);
       const img = item.querySelector('img');
       const src = img ? img.getAttribute('src') : '';
@@ -234,7 +263,7 @@
         img ? parseInt(img.getAttribute('width'), 10) || 0 : 0,
         img ? parseInt(img.getAttribute('height'), 10) || 0 : 0
       );
-    }).filter((e) => e.name);
+    }).filter((e) => e && e.name);
   }
 
   // ---------- debug helper ----------
@@ -1003,6 +1032,11 @@
       // real emote imgs are usually 20-80px and served from one dir.
       const src = img.getAttribute('src') || '';
       if (!src || /\.(svg|gif)($|\?)/i.test(src) && /logo|icon|flag/i.test(src)) return;
+      // Reject site chrome that merely looks like a titled clickable row —
+      // e.g. trending stream entries (vs_v9_content_menu_item with
+      // ShowContentPreview onclicks) were being harvested as "emotes".
+      const onclick = holder.getAttribute('onclick') || String(holder.onclick || '');
+      if (!looksLikeEmoteItem(holder, onclick)) return;
       // Inside the chat area but NOT clickable -> it's a badge/emote shown
       // in a message, not a picker item. Ignore it. (Exception: anything
       // under the emoji toggle button is the menu itself, keep it.)
@@ -1012,7 +1046,6 @@
       const key = title.toLowerCase();
       if (seen.has(key)) return;
       seen.add(key);
-      const onclick = holder.getAttribute('onclick') || String(holder.onclick || '');
       const idMatch = onclick.match(/insertEmoji\(\s*['"]([^'"]+)['"]\s*,/);
       results.push(makeEmote(
         idMatch ? idMatch[1] : '',
@@ -1208,6 +1241,9 @@
       if (!title) continue;
       const clickable = !!(holder.getAttribute('onclick') || clickListenerTargets.has(holder));
       if (!clickable) continue;
+      // Same chrome filter as the main parsers: hover-driven trending stream
+      // rows are "clickable" too but must never enter the emote store.
+      if (!looksLikeEmoteItem(holder, holder.getAttribute('onclick') || '')) continue;
       const key = title.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
