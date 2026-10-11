@@ -61,6 +61,39 @@
   }
   hookDocument(document);
 
+  // ---- cross-frame coordination ------------------------------------------
+  // If the chat lives in a CROSS-ORIGIN iframe (e.g. vaughn.live embedding a
+  // streamlabs/twitch chat frame), the top frame's script cannot reach into
+  // it at all. The content script DOES run inside that frame though
+  // (all_frames:true), so the child posts its harvested emotes up to us via
+  // window.postMessage, and we merge them into our store.
+  const MSG_TAG = 'vaughn-emote-autocomplete';
+  function isTopFrame() { try { return window.top !== window.self; } catch (_) { return false; } }
+  const pendingChildEmotes = [];   // buffered messages received before store ready
+
+  window.addEventListener('message', (ev) => {
+    if (ev.source === window) return;                 // only from child frames
+    const d = ev.data;
+    if (!d || d.__vaughnEmoteMsg !== MSG_TAG || !Array.isArray(d.emotes)) return;
+    if (emotes.size > 0) return;                       // already have a list
+    if (d.emotes.length > 0) {
+      storeEmotes(d.emotes);
+      console.log(`[Vaughn Emotes] Received ${emotes.size} emotes from child frame (${d.frameUrl || 'cross-origin'}).`);
+    } else {
+      pendingChildEmotes.push(d);                      // frame opened but rendered nothing yet
+    }
+  });
+
+  function postEmotesToParent(list) {
+    try {
+      window.parent.postMessage({
+        __vaughnEmoteMsg: MSG_TAG,
+        frameUrl: location.href,
+        emotes: list.map((e) => ({ id: e.id, name: e.name, filename: e.filename, width: e.width, height: e.height })),
+      }, '*');
+    } catch (_) {}
+  }
+
   let virtualRefreshScheduled = false;
   let lastVirtualClickAt = 0;
   const VIRTUAL_CLICK_COOLDOWN_MS = 5 * 1000;   // retry quickly, capped by MAX_ATTEMPTS
@@ -246,25 +279,54 @@
     return best || fallback;
   }
 
-  function findEmojiButton() {
-    // Search the *document that actually contains the chat input*, not just
-    // our own. With all_frames:true the script runs in every frame; if the
-    // chat lives inside a same-origin iframe, the emoji button is in THAT
-    // frame's document and a plain document.querySelector can never see it.
-    const docs = new Set([document]);
-    if (chatInput && chatInput.ownerDocument) docs.add(chatInput.ownerDocument);
+
+  // ---- Cross-frame document registry -------------------------------------
+  // With all_frames:true this script also runs inside the chat iframe and
+  // registers itself with the top frame. We keep a list of every reachable
+  // same-origin child document (recursively) so button search, harvesting
+  // and diagnostics cover frames we cannot querySelector our way into.
+  const foreignDocs = new Set();
+  function registerForeignDoc(doc) {
+    if (!doc || doc === document) return;
     try {
-      for (const f of Array.from(document.querySelectorAll('iframe'))) {
-        if (f.contentDocument) {
-          hookDocument(f.contentDocument); // record addEventListener('click') calls
-          docs.add(f.contentDocument);
+      doc.__vaughnEmoteScriptRan = true;
+      foreignDocs.add(doc);
+      hookDocument(doc);
+    } catch (_) {}
+  }
+  function allReachableDocs() {
+    const docs = [document];
+    if (chatInput && chatInput.ownerDocument && !docs.includes(chatInput.ownerDocument)) {
+      docs.push(chatInput.ownerDocument);
+    }
+    for (const d of foreignDocs) if (!docs.includes(d)) docs.push(d);
+    // Depth-first scan of same-origin iframes from every known document.
+    const queue = [...docs];
+    while (queue.length) {
+      const doc = queue.shift();
+      let frames = [];
+      try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (_) {}
+      for (const f of frames) {
+        let cd = null;
+        try { cd = f.contentDocument; } catch (_) {}
+        if (cd && cd.body && !docs.includes(cd)) {
+          docs.push(cd);
+          queue.push(cd);
+          try { if (!cd.__vaughnEmoteScriptRan) registerForeignDoc(cd); } catch (_) {}
         }
       }
-    } catch (_) {}
+    }
+    return docs;
+  }
 
-    for (const doc of docs) {
+  function findEmojiButton() {
+    // Search EVERY reachable same-origin document: our own, the chat input's
+    // owner document, any iframe that registered itself with us, and child
+    // iframes we can walk into directly. A plain document.querySelector in
+    // the top frame can never see a picker living in the chat iframe.
+    for (const doc of allReachableDocs()) {
       let scope = doc.body;
-      if (doc === (chatInput && chatInput.ownerDocument) && chatInput) {
+      if (chatInput && doc === chatInput.ownerDocument) {
         scope = chatInput.closest('[class*="chat"], form, [class*="footer"], [class*="input"]') || doc.body;
       }
       const local = searchDocForEmojiButton(scope);
@@ -412,13 +474,7 @@
     // The picker may render into a DIFFERENT document than ours (chat inside
     // a same-origin iframe). Scan all reachable documents for emote items.
     const harvestAllDocs = () => {
-      const docs = new Set([document]);
-      try {
-        document.querySelectorAll('iframe').forEach((f) => {
-          if (f.contentDocument && f.contentDocument.body) docs.add(f.contentDocument);
-        });
-      } catch (_) {}
-      for (const doc of docs) {
+      for (const doc of allReachableDocs()) {
         const list = parseEmotesFromDOM(doc);
         if (list.length > 0) return list;
       }
@@ -446,11 +502,15 @@
       if (list.length > 0) {
         storeEmotes(list);
         console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes via virtual picker click.`);
+        if (!isTopFrame()) postEmotesToParent(Array.from(emotes.values()));
       } else {
         console.warn(
           `[Vaughn Emotes] Virtual picker click (attempt ${virtualClickAttempts}/${VIRTUAL_CLICK_MAX_ATTEMPTS}) rendered no emote items.`
         );
         dumpEmojiDiagnostics();
+        // Tell the parent frame we tried and found nothing, so a top-frame
+        // instance stuck on 0 can stop guessing and log a useful message.
+        if (!isTopFrame()) postEmotesToParent([]);
       }
     } finally {
       if (harvestTimer) clearInterval(harvestTimer);
@@ -615,6 +675,13 @@
     }
     storeEmotes(list);
     console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes`);
+
+    if (emotes.size === 0 && !isTopFrame()) {
+      // This frame may be the real chat (possibly cross-origin from the
+      // parent). Share whatever we have — even an empty list — so the
+      // top frame can stop guessing. We re-post after each virtual click.
+      postEmotesToParent([]);
+    }
 
     if (emotes.size === 0) {
       // Nothing yet -> virtually open the emoji picker to force-render it.
@@ -784,7 +851,14 @@
     if (!chatInput && emotes.size === 0) {
       setTimeout(() => {
         if (!chatInput && emotes.size === 0 && !document.querySelector('iframe')) {
-          console.warn('[Vaughn Emotes] No chat input or iframes found in this frame.');
+          if (pendingChildEmotes.length > 0) {
+            console.warn(
+              '[Vaughn Emotes] Chat iframe detected its own picker but rendered no emote items. ' +
+              'Copy the [Vaughn Emotes] DIAGNOSTICS output from the IFRAME console (devtools frame selector) here.'
+            );
+          } else {
+            console.warn('[Vaughn Emotes] No chat input or iframes found in this frame.');
+          }
         }
       }, 8000);
     }
