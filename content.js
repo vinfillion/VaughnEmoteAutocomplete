@@ -120,9 +120,6 @@
     }).filter((e) => e.name);
   }
 
-  // Candidate selectors, most specific first. Vaughn's CSS classes carry a
-  // version suffix (vs_chatv9_*), which changes over time — prefix/substring
-  // selectors survive those renames, exact ones don't.
   // ---------- debug helper ----------
   // Dumps every "emoji-ish" element, the click-listener map near the chat
   // input, and image src patterns, so we can see what the real markup is.
@@ -250,22 +247,31 @@
   }
 
   function findEmojiButton() {
-    const scope = chatInput
-      ? (chatInput.closest('[class*="chat"], form, [class*="footer"], [class*="input"]') || document.body)
-      : document.body;
-    const local = searchDocForEmojiButton(scope.ownerDocument === document ? scope : document);
-    if (local) return local;
-    const globalBtn = searchDocForEmojiButton(document);
-    if (globalBtn) return globalBtn;
-    // Same-origin child frames (chat may live in an iframe whose document
-    // this script also runs in — but as a belt-and-braces measure, look too).
+    // Search the *document that actually contains the chat input*, not just
+    // our own. With all_frames:true the script runs in every frame; if the
+    // chat lives inside a same-origin iframe, the emoji button is in THAT
+    // frame's document and a plain document.querySelector can never see it.
+    const docs = new Set([document]);
+    if (chatInput && chatInput.ownerDocument) docs.add(chatInput.ownerDocument);
     try {
       for (const f of Array.from(document.querySelectorAll('iframe'))) {
-        hookDocument(f.contentDocument); // make sure its listeners get recorded
-        const inFrame = f.contentDocument && searchDocForEmojiButton(f.contentDocument);
-        if (inFrame) return inFrame;
+        if (f.contentDocument) {
+          hookDocument(f.contentDocument); // record addEventListener('click') calls
+          docs.add(f.contentDocument);
+        }
       }
     } catch (_) {}
+
+    for (const doc of docs) {
+      let scope = doc.body;
+      if (doc === (chatInput && chatInput.ownerDocument) && chatInput) {
+        scope = chatInput.closest('[class*="chat"], form, [class*="footer"], [class*="input"]') || doc.body;
+      }
+      const local = searchDocForEmojiButton(scope);
+      if (local) return local;
+      const globalBtn = searchDocForEmojiButton(doc);
+      if (globalBtn) return globalBtn;
+    }
     return null;
   }
 
@@ -386,9 +392,8 @@
 
     const hadFocus = document.activeElement;
 
-    // Hide ONLY popups that newly appear after the click, so harvesting is
-    // invisible. Never touch <html>/<body> (the old page-wide visibility
-    // rule broke lazy rendering).
+    // Snapshot every element currently in the body. After the click we only
+    // consider elements that were NOT present before — i.e. newly rendered.
     const beforeNodes = new WeakSet();
     document.querySelectorAll('body *').forEach((el) => beforeNodes.add(el));
     const hiddenForHarvest = [];
@@ -404,13 +409,40 @@
       });
     };
 
+    // The picker may render into a DIFFERENT document than ours (chat inside
+    // a same-origin iframe). Scan all reachable documents for emote items.
+    const harvestAllDocs = () => {
+      const docs = new Set([document]);
+      try {
+        document.querySelectorAll('iframe').forEach((f) => {
+          if (f.contentDocument && f.contentDocument.body) docs.add(f.contentDocument);
+        });
+      } catch (_) {}
+      for (const doc of docs) {
+        const list = parseEmotesFromDOM(doc);
+        if (list.length > 0) return list;
+      }
+      return [];
+    };
+
     let harvestTimer = null;
     try {
       fullClickSequence(btn);
       harvestTimer = setInterval(suppressNewPopups, 50);
       suppressNewPopups();
 
-      const list = await waitForDomEmotes(4000);
+      // Poll up to 4s waiting for lazy-rendered emote items in ANY frame.
+      const list = await (() => {
+        return new Promise((resolve) => {
+          const start = Date.now();
+          const poll = () => {
+            const l = harvestAllDocs();
+            if (l.length > 0 || Date.now() - start > 4000) { resolve(l); return; }
+            setTimeout(poll, 150);
+          };
+          poll();
+        });
+      })();
       if (list.length > 0) {
         storeEmotes(list);
         console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes via virtual picker click.`);
@@ -430,13 +462,16 @@
           new ((doc2.defaultView || window).KeyboardEvent)('keydown', { key: 'Escape', bubbles: true })
         );
       } catch (_) {}
-      if (parseEmotesFromDOM().length > 0) fullClickSequence(btn);
+      if (harvestAllDocs().length > 0) fullClickSequence(btn);
       if (hadFocus && typeof hadFocus.focus === 'function') hadFocus.focus({ preventScroll: true });
     }
 
     if (emotes.size === 0) scheduleVirtualEmoteLoad(3000);
   }
 
+  // Candidate selectors, most specific first. Vaughn's CSS classes carry a
+  // version suffix (vs_chatv9_*), which changes over time — prefix/substring
+  // selectors survive those renames, exact ones don't.
   const EMOTE_ITEM_SELECTORS = [
     '.vs_chatv9_emoji_item',
     '[class*="emoji_item"]',
@@ -449,8 +484,9 @@
   // contain an <img> and have a title — whatever their class is. This is
   // how virtually every emoji picker is structured, so it survives site
   // CSS renames (vs_chatv9_* -> vs_chatv10_* etc.).
-  function parseEmotesGenericFromDOM() {
-    const candidates = document.querySelectorAll(
+  function parseEmotesGenericFromDOM(doc) {
+    doc = doc || document;
+    const candidates = doc.querySelectorAll(
       '[title] img, [title] > img, button img, [role="button"] img, li img, span[class] img, div[class] img'
     );
     const results = [];
@@ -487,9 +523,10 @@
     return [];
   }
 
-  function parseEmotesFromDOM() {
+  function parseEmotesFromDOM(doc) {
+    doc = doc || document;
     for (const sel of EMOTE_ITEM_SELECTORS) {
-      const items = document.querySelectorAll(sel);
+      const items = doc.querySelectorAll(sel);
       if (items.length === 0) continue;
       const parsed = extractEmotes(items);
       if (parsed.length > 0) {
@@ -497,7 +534,7 @@
         return parsed;
       }
     }
-    const generic = parseEmotesGenericFromDOM();
+    const generic = parseEmotesGenericFromDOM(doc);
     if (generic.length > 0) return generic;
     // Final resort: React fiber props (survives any CSS rename / missing titles).
     const fiber = harvestFromReactFiber();
