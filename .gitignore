@@ -5,7 +5,5 @@ test_*.js
 debug_*.js
 *.log
 
-# Build artifacts
-*.xpi
+# Build artifacts (keep the latest release .xpi tracked so it's available on GitHub)
 *.zip
-vaughn-emote-autocomplete-*.xpi
