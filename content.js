@@ -26,6 +26,26 @@
   let currentMatches = [];
   let observer = null;
 
+  // The emoji list is NOT in the initial HTML — it only exists once the
+  // user opens the emoji picker (or after a site XHR fills it). So we
+  // watch for the picker button and "virtually click" it in the
+  // background to force-render the list, then restore the page state.
+  let virtualRefreshScheduled = false;
+  let lastVirtualClickAt = 0;
+  const VIRTUAL_CLICK_COOLDOWN_MS = 60 * 1000;   // don't spam-click
+  const VIRTUAL_CLICK_MAX_ATTEMPTS = 3;
+  let virtualClickAttempts = 0;
+
+  function scheduleVirtualEmoteLoad() {
+    if (virtualRefreshScheduled || emotes.size > 0) return;
+    if (Date.now() - lastVirtualClickAt < VIRTUAL_CLICK_COOLDOWN_MS) return;
+    virtualRefreshScheduled = true;
+    setTimeout(() => {
+      virtualRefreshScheduled = false;
+      virtualLoadEmotesByClickingPicker();
+    }, 2500);
+  }
+
   // ---------- helpers ----------
 
   // Parse emote name - remove surrounding parentheses/brackets
@@ -50,6 +70,155 @@
   }
 
   // ---------- emote loading ----------
+
+  // Snapshot the current inline styles of an element so we can restore them.
+  function snapshotStyle(el) {
+    return el ? el.getAttribute('style') : null;
+  }
+  function restoreStyle(el, snap) {
+    if (!el) return;
+    if (snap === null) el.removeAttribute('style');
+    else el.setAttribute('style', snap);
+  }
+
+  // Find the emoji-picker toggle button next to the chat input.
+  // Strategy: start from the input's containing area and look for small
+  // clickable elements that are likely the emoji button — by class hint,
+  // by aria/title text, or by being a bare <button> near the send button.
+  function looksLikeEmojiToggle(el) {
+    if (!el || el === chatInput) return false;
+    const label = (
+      el.getAttribute('title') ||
+      el.getAttribute('aria-label') ||
+      el.textContent || ''
+    ).toLowerCase();
+    const cls = (el.className && String(el.className)).toLowerCase();
+    return /emoji|emote/.test(cls) || /emoji|emote|smile/.test(label);
+  }
+
+  function findEmojiButton() {
+    const scope = chatInput
+      ? (chatInput.closest('[class*="chat"], form, [class*="footer"], [class*="input"]') || document.body)
+      : document.body;
+
+    // 1. Direct class match for the toggle (vs_chatv9_emoji_button etc.)
+    const direct = scope.querySelector(
+      'button[class*="emoji"], [class*="emoji_button"], [class*="emoji-btn"], [class*="emojibtn"]'
+    );
+    if (direct) return direct;
+
+    // 2. Any clickable element whose class/label mentions emoji/emote.
+    const candidates = scope.querySelectorAll(
+      'button, [role="button"], a, span[class*="emoji"], div[class*="emoji"], i[class*="emoji"], svg[class*="emoji"]'
+    );
+    for (const el of candidates) {
+      if (looksLikeEmojiToggle(el)) return el;
+    }
+
+    // 3. Chat inputs often live in an iframe with the picker. Search all
+    //    same-origin frames too.
+    try {
+      for (const f of Array.from(document.querySelectorAll('iframe'))) {
+        const d = f.contentDocument;
+        if (!d) continue; // cross-origin, skip silently
+        const inFrame = d.querySelector(
+          'button[class*="emoji"], [class*="emoji_button"], [title*="moji" i], [aria-label*="moji" i]'
+        );
+        if (inFrame) return inFrame;
+      }
+    } catch (_) { /* ignore frame access errors */ }
+
+    return null;
+  }
+
+  // Wait until either emotes appear in the DOM, or timeout.
+  // Returns the parsed list (possibly empty).
+  function waitForDomEmotes(timeoutMs) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const poll = () => {
+        const list = parseEmotesFromDOM();
+        if (list.length > 0 || Date.now() - start > timeoutMs) {
+          resolve(list);
+          return;
+        }
+        setTimeout(poll, 150);
+      };
+      poll();
+    });
+  }
+
+  // THE MAIN LOADER: virtually open the emoji picker, harvest the items,
+  // then close it again so the user never sees anything happen.
+  async function virtualLoadEmotesByClickingPicker() {
+    if (emotes.size > 0) return;
+    if (virtualClickAttempts >= VIRTUAL_CLICK_MAX_ATTEMPTS) return;
+    virtualClickAttempts += 1;
+    lastVirtualClickAt = Date.now();
+
+    // The chat UI may not be rendered yet; make sure we at least have the
+    // right document scope before searching for the emoji button.
+    tryInitInput();
+
+    const btn = findEmojiButton();
+    if (!btn) {
+      console.warn('[Vaughn Emotes] Virtual load: emoji picker button not found yet.');
+      scheduleVirtualEmoteLoad(); // retry later once the chat renders
+      return;
+    }
+
+    // Record page state so we can undo our interference.
+    const hadFocus = document.activeElement;
+    const bodySnap = snapshotStyle(document.body);
+
+    // Temporarily neutralize transitions/animations so opening & closing
+    // the popup is instant and invisible.
+    const animKiller = document.createElement('style');
+    animKiller.textContent =
+      '#vaughn-emote-anim-killer *, #vaughn-emote-anim-killer {' +
+      'animation: none !important; transition: none !important; visibility: hidden !important;' +
+      '}';
+    animKiller.id = 'vaughn-emote-anim-killer-root';
+    document.documentElement.appendChild(animKiller);
+    // Apply the killer class to html so the rule above matches everything:
+    document.documentElement.classList.add('vaughn-emote-anim-killer');
+
+    try {
+      // Open the picker via a synthetic click sequence (some sites only
+      // react to pointer/mouse events, so fire both).
+      btn.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+      btn.dispatchEvent(new MouseEvent('mousedown',  { bubbles: true, cancelable: true }));
+      btn.click();
+      btn.dispatchEvent(new MouseEvent('mouseup',    { bubbles: true, cancelable: true }));
+      btn.dispatchEvent(new MouseEvent('click',      { bubbles: true, cancelable: true }));
+
+      // Give the site time to render (or XHR-fill) the emoji list.
+      const list = await waitForDomEmotes(4000);
+
+      if (list.length > 0) {
+        storeEmotes(list);
+        console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes via virtual picker click.`);
+      } else {
+        console.warn('[Vaughn Emotes] Virtual picker click rendered no emote items.');
+      }
+    } finally {
+      // Close the picker again: press Escape, click elsewhere, then click
+      // the toggle back if it's still open.
+      document.documentElement.classList.remove('vaughn-emote-anim-killer');
+      animKiller.remove();
+
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      if (parseEmotesFromDOM().length > 0) {
+        // Popup still open -> click the toggle again to close it
+        btn.click();
+      }
+
+      restoreStyle(document.body, bodySnap);
+      if (hadFocus && typeof hadFocus.focus === 'function') hadFocus.focus({ preventScroll: true });
+    }
+
+    if (emotes.size === 0) scheduleVirtualEmoteLoad(); // one more chance later
+  }
 
   // Generic parser: given a NodeList of candidate emoji-item elements,
   // extract {id, name, ...} from title + onclick, whatever the exact
@@ -155,15 +324,22 @@
   let loadedFromHtml = false;
 
   async function loadEmotes() {
-    // Prefer live DOM (the emoji picker may already be rendered);
-    // fall back to fetching the page HTML.
+    // The emoji list is rendered lazily (only when the picker is opened),
+    // so a plain DOM query at page-load will find nothing. Try anyway —
+    // maybe the user already opened it or the site pre-renders it.
     let list = parseEmotesFromDOM();
     if (list.length === 0 && !loadedFromHtml) {
+      // Fallback: some servers do include the picker markup in the HTML.
       list = await fetchEmotesHTML();
       if (list.length > 0) loadedFromHtml = true;
     }
     storeEmotes(list);
     console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes`);
+
+    if (emotes.size === 0) {
+      // Nothing yet -> virtually open the emoji picker to force-render it.
+      scheduleVirtualEmoteLoad();
+    }
   }
 
   // ---------- autocomplete UI ----------
@@ -312,24 +488,46 @@
   // ---------- main init ----------
 
   async function init() {
-    // Only run in the top frame / actual chat page context
-    if (window.top !== window.self) return;
+    // IMPORTANT: the Vaughn chat (input + emoji picker) is rendered inside
+    // an iframe, and content scripts run in every frame ("all_frames": true).
+    // The old top-frame-only guard made the script exit immediately in the
+    // chat iframe — that's why you saw "Loaded 0 emotes" / nothing happened.
 
     buildUI();
     tryInitInput();
     await loadEmotes();
 
+    // If this frame has no chat input at all, it's probably the top page
+    // while the real chat lives in a same-origin iframe (the content script
+    // runs there too thanks to all_frames). Wait a bit and re-check before
+    // giving up — avoids duplicate dropdowns / double virtual clicks.
+    if (!chatInput && emotes.size === 0) {
+      setTimeout(() => {
+        if (!chatInput && emotes.size === 0 && !document.querySelector('iframe')) {
+          console.warn('[Vaughn Emotes] No chat input or iframes found in this frame.');
+        }
+      }, 8000);
+    }
+
     // The chat UI may render late or be replaced; watch for it.
+    let domParseThrottle = 0;
     observer = new MutationObserver(() => {
       if (!chatInput || !document.contains(chatInput)) {
         chatInput = null;
         tryInitInput();
       }
       // If emotes haven't loaded yet (picker not rendered on first pass),
-      // retry parsing from DOM whenever the page mutates.
-      if (emotes.size === 0) {
+      // retry parsing from DOM whenever the page mutates — this catches
+      // the case where the USER opens the emoji picker themselves, and
+      // also when our virtual click renders it. Throttled to avoid
+      // re-parsing on every single mutation.
+      if (emotes.size === 0 && Date.now() - domParseThrottle > 500) {
+        domParseThrottle = Date.now();
         const domList = parseEmotesFromDOM();
-        if (domList.length) storeEmotes(domList);
+        if (domList.length) {
+          storeEmotes(domList);
+          console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes (picker detected in DOM).`);
+        }
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
