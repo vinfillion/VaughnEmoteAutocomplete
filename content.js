@@ -29,11 +29,13 @@
   // CRITICAL: isTopFrame() returns TRUE when we are inside a frame (the
   // chat iframe). Those frames never get the CSS injected by the manifest
   // ("css" is only applied to the top document), so we inject it ourselves.
-  function ensureStyleInThisDocument() {
+  function ensureStyleInThisDocument(doc) {
+    doc = doc || document;
     try {
-      if (document.getElementById('vaughn-emote-style')) return;
-      const link = document.querySelector('link[href*="content.css"]');
-      const style = document.createElement('style');
+      if (doc.getElementById('vaughn-emote-style')) return;
+      const link = document.querySelector('link[href*="content.css"]') ||
+                   doc.querySelector('link[href*="content.css"]');
+      const style = doc.createElement('style');
       style.id = 'vaughn-emote-style';
       if (link) {
         fetch(link.href).then((r) => r.text()).then((t) => { style.textContent = t; }).catch(() => {});
@@ -44,7 +46,7 @@
           '.vaughn-emote-item:hover,.vaughn-emote-active{background:#3b3b5c}',
         ].join('\n');
       }
-      (document.head || document.documentElement).appendChild(style);
+      (doc.head || doc.documentElement).appendChild(style);
     } catch (_) {}
   }
 
@@ -1273,22 +1275,32 @@
     // odd browser states — fall back to end-of-value instead of throwing.
     if (pos === null || pos === undefined) return null;
     const textUpToCursor = chatInput.value.slice(0, pos);
-    for (const trigger of TRIGGER_CHARS) {
-      // Scan backwards from the cursor for the nearest trigger char. Stop at
-      // any whitespace or at a second trigger char — otherwise text like
-      // ":emote5: " would match on the *closing* colon and produce the
-      // bogus query "5 ". This also fixes inserting an emote and then
-      // typing ":" again right after it.
-      let idx = -1;
-      for (let i = pos - 1; i >= 0; i--) {
-        const ch = textUpToCursor[i];
-        if (/\s/.test(ch)) break;
-        if (ch === trigger) { idx = i; break; }
-        if (TRIGGER_CHARS.includes(ch)) return null; // crossed another trigger
-      }
-      if (idx === -1) continue;
+    // IMPORTANT: only the text BEFORE the cursor is ever considered. The
+    // chat box is a <textarea> whose Enter key inserts "\n" (submitChat
+    // handles sending), so `value` can contain multiline history — anything
+    // after the cursor must never influence the query.
+    // Single backward scan finds the NEAREST trigger char before the cursor.
+    // The old per-trigger loop aborted with `return null` as soon as the
+    // ':' scan crossed a '!' (and vice-versa), so e.g. "!po" could return
+    // null depending on TRIGGER_CHARS order — one of the reasons the
+    // dropdown never appeared while typing.
+    let idx = -1;
+    let trigger = null;
+    for (let i = pos - 1; i >= 0; i--) {
+      const ch = textUpToCursor[i];
+      if (/\s/.test(ch)) break;              // start of current word
+      if (TRIGGER_CHARS.includes(ch)) {
+        idx = i;                             // nearest trigger char before cursor
+        trigger = ch;
+        break;                               // everything between it and the
+      }                                      // cursor is the live query
+    }
+    if (idx !== -1 && trigger) {
       const query = textUpToCursor.slice(idx + 1);
-      // Query must have no whitespace in it (it's a live word being typed)
+      // e.g. ":smile:" with cursor right after the closing colon -> the
+      // nearest trigger IS the closing colon and query is empty; show the
+      // full list only when there is at least one char to filter by, and
+      // hide otherwise (handled by caller via MIN_QUERY_LEN).
       if (/^\S*$/.test(query)) {
         return { trigger, index: idx, query };
       }
@@ -1356,7 +1368,7 @@
     // real page the input is only discovered at load, but buildUI could be
     // skipped by any earlier exception -> dropdown stayed null forever and
     // the popup NEVER appeared. Create it on demand instead.
-    if (!dropdown || !document.contains(dropdown)) buildUI();
+    if (!dropdown || !(chatInput.ownerDocument || document).contains(dropdown)) buildUI();
     if (!dropdown) return;
     const q = getQuery();
     if (!q || !q.query) return hideAutocomplete();   // need at least ":x" — ":" alone shows nothing
@@ -1371,9 +1383,10 @@
     // between "never shown" and "shown then removed".
     setTimeout(() => {
       try {
-        if (dropdown && !document.contains(dropdown)) {
+        const ddoc = (chatInput && chatInput.ownerDocument) || document;
+        if (dropdown && !ddoc.contains(dropdown)) {
           console.warn('[Vaughn Emotes] Dropdown was REMOVED from the DOM shortly after being shown — the site wipes our node.');
-          document.documentElement.appendChild(dropdown);
+          (ddoc.body || ddoc.documentElement).appendChild(dropdown);
         } else if (dropdown && dropdown.parentElement && dropdown.style.display === 'block') {
           console.log('[Vaughn Emotes] Dropdown is in the DOM and visible (items:', dropdown.children.length + ').');
         }
@@ -1393,7 +1406,10 @@
     const q = getQuery();
     const pos = chatInput.selectionStart;
     const start = q ? q.index : pos;
-    const insert = `:${emote.name}: `;
+    // Preserve whichever trigger the user typed: ':foo' inserts ':name: ',
+    // '!foo' inserts 'name: ' (vaughn-style emote codes). The old code always
+    // inserted a leading colon, which corrupted '!' queries on replace.
+    const insert = (q && q.trigger === '!' ? '' : ':') + emote.name + ': ';
     chatInput.value =
       chatInput.value.slice(0, start) + insert + chatInput.value.slice(pos);
     const newPos = start + insert.length;
@@ -1461,13 +1477,20 @@
   }
 
   function buildUI() {
-    if (dropdown && document.contains(dropdown)) return; // one per document
-    dropdown = null; // drop stale node from a replaced document
-    ensureStyleInThisDocument();
-    dropdown = document.createElement('div');
+    // The dropdown MUST be appended to the same document that contains the
+    // chat input. When the script runs at document_idle and the chat lives
+    // inside an iframe, `document` here is the TOP page while `chatInput`
+    // belongs to the iframe's document. Appending the popup to the wrong
+    // document makes it permanently invisible no matter what we set on it —
+    // exactly the "autocomplete never appears" symptom.
+    const targetDoc = (chatInput && chatInput.ownerDocument) || document;
+    if (dropdown && targetDoc.contains(dropdown)) return; // one per document
+    dropdown = null; // drop stale node from a replaced/wrong document
+    ensureStyleInThisDocument(targetDoc);
+    dropdown = targetDoc.createElement('div');
     dropdown.id = 'vaughn-emote-dropdown';
     dropdown.style.display = 'none';
-    document.documentElement.appendChild(dropdown);
+    (targetDoc.body || targetDoc.documentElement).appendChild(dropdown);
   }
 
   // The dropdown is only useful in the frame that actually contains the chat
