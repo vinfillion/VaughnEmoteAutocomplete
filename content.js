@@ -27,26 +27,55 @@
   let observer = null;
 
   // The emoji list is NOT in the initial HTML — it only exists once the
-  // user opens the emoji picker (or after a site XHR fills it). So we
-  // watch for the picker button and "virtually click" it in the
-  // background to force-render the list, then restore the page state.
+  // user opens the emoji picker. Instead of virtually clicking the picker
+  // button (which fails when the click handler is React-attached, or when
+  // the button matched isn't the real toggle), we hook addEventListener on
+  // every document and record which elements have a 'click' listener.
+  // The element near the chat input that has BOTH an emoji-ish hint AND a
+  // registered click listener is almost certainly the real toggle; we then
+  // dispatch a native click on exactly that element.
+  const hookedDocs = new WeakSet();
+  const clickListenerTargets = new WeakSet();
+
+  function hookDocument(doc) {
+    if (!doc || hookedDocs.has(doc)) return;
+    try {
+      hookedDocs.add(doc);
+      const win = doc.defaultView;
+      if (!win) return;
+      const proto = win.EventTarget && win.EventTarget.prototype;
+      if (!proto || proto.__vaughnAelHooked) return;
+      const origAdd = proto.addEventListener;
+      proto.addEventListener = function (type, fn, opts) {
+        if (type === 'click') {
+          try {
+            if (this instanceof win.Node) clickListenerTargets.add(this);
+          } catch (_) {}
+        }
+        return origAdd.call(this, type, fn, opts);
+      };
+      proto.__vaughnAelHooked = true;
+      // Elements with an onclick ATTRIBUTE (not addEventListener) are
+      // detected separately via getAttribute('onclick') in findEmojiButton.
+    } catch (_) { /* sandbox restrictions — ignore */ }
+  }
+  hookDocument(document);
+
   let virtualRefreshScheduled = false;
   let lastVirtualClickAt = 0;
-  const VIRTUAL_CLICK_COOLDOWN_MS = 60 * 1000;   // don't spam-click
-  const VIRTUAL_CLICK_MAX_ATTEMPTS = 3;
+  const VIRTUAL_CLICK_COOLDOWN_MS = 5 * 1000;   // retry quickly, capped by MAX_ATTEMPTS
+  const VIRTUAL_CLICK_MAX_ATTEMPTS = 8;
   let virtualClickAttempts = 0;
 
-  function scheduleVirtualEmoteLoad() {
+  function scheduleVirtualEmoteLoad(delayMs) {
     if (virtualRefreshScheduled || emotes.size > 0) return;
     if (Date.now() - lastVirtualClickAt < VIRTUAL_CLICK_COOLDOWN_MS) return;
     virtualRefreshScheduled = true;
     setTimeout(() => {
       virtualRefreshScheduled = false;
       virtualLoadEmotesByClickingPicker();
-    }, 2500);
+    }, delayMs || 2500);
   }
-
-  // ---------- helpers ----------
 
   // Parse emote name - remove surrounding parentheses/brackets
   const parseEmoteName = (name) => (name || '').replace(/^[\(\)\[\]:]+|[\(\)\[\]:]+$/g, '').trim();
@@ -67,261 +96,6 @@
       if (el && el.offsetParent !== null) return el; // visible elements only
     }
     return null;
-  }
-
-  // ---------- emote loading ----------
-
-  // ---------- debug helper ----------
-  // Run this in the page console (or read its output in the add-on content
-  // script console) when loading fails: it dumps every candidate "emoji-ish"
-  // element and every image src pattern near the chat input, so we can see
-  // what the real markup actually is instead of guessing selectors.
-  function dumpEmojiDiagnostics() {
-    const info = {
-      frameUrl: location.href,
-      isTopFrame: window.top === window.self,
-      chatInputFound: !!findChatInput(),
-      emojiishElements: [],
-      clickablesNearInput: [],
-      imgSrcSamples: [],
-    };
-
-    document.querySelectorAll('*').forEach((el) => {
-      const hay = (
-        (typeof el.className === 'string' ? el.className : '') + ' ' +
-        (el.id || '') + ' ' +
-        (el.getAttribute('title') || '') + ' ' +
-        (el.getAttribute('aria-label') || '')
-      ).toLowerCase();
-      if (/emoji|emote|smile/.test(hay)) {
-        info.emojiishElements.push({
-          tag: el.tagName,
-          id: el.id,
-          class: typeof el.className === 'string' ? el.className : '',
-          title: el.getAttribute('title'),
-          aria: el.getAttribute('aria-label'),
-          children: el.children.length,
-        });
-      }
-    });
-
-    const input = findChatInput();
-    if (input) {
-      let scope = input.parentElement;
-      for (let i = 0; i < 5 && scope && scope !== document.body; i++) scope = scope.parentElement;
-      scope = scope || document.body;
-      scope.querySelectorAll('button, [role="button"], a, svg, i, span').forEach((el) => {
-        if (info.clickablesNearInput.length >= 30) return;
-        info.clickablesNearInput.push({
-          tag: el.tagName,
-          class: typeof el.className === 'string' ? el.className : String(el.className || ''),
-          title: el.getAttribute('title'),
-          aria: el.getAttribute('aria-label'),
-          text: (el.textContent || '').trim().slice(0, 10),
-        });
-      });
-    }
-
-    const seenSrc = new Set();
-    document.querySelectorAll('img').forEach((img) => {
-      const src = img.getAttribute('src') || '';
-      // normalize: strip trailing filename to group by directory/pattern
-      const dir = src.replace(/[^/]*$/, '');
-      if (!seenSrc.has(dir) && src) {
-        seenSrc.add(dir);
-        if (info.imgSrcSamples.length < 20) info.imgSrcSamples.push(src.slice(0, 140));
-      }
-    });
-
-    console.log('[Vaughn Emotes] DIAGNOSTICS:', JSON.stringify(info, null, 2));
-    return info;
-  }
-  // Expose it so you can call it manually from the console too.
-  try { window.__vaughnEmoteDiag = dumpEmojiDiagnostics; } catch (_) {}
-
-  // Find the emoji-picker toggle button next to the chat input.
-  // Broadened strategy: class hints, aria/title hints, AND unicode emoji
-  // glyphs as button content (many sites use a bare 😀/😃 text icon).
-  const EMOJI_GLYPH_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/u;
-
-  function looksLikeEmojiToggle(el) {
-    if (!el || el === chatInput) return false;
-    const label = (
-      (el.getAttribute && (el.getAttribute('title') || el.getAttribute('aria-label'))) ||
-      (el.textContent || '')
-    ).toLowerCase();
-    const cls = (el.className && String(el.className)).toLowerCase();
-    return /emoji|emote|smile|face/.test(cls) ||
-           /emoji|emote|smile|face/.test(label) ||
-           EMOJI_GLYPH_RE.test(label);
-  }
-
-  function searchDocForEmojiButton(doc) {
-    // 1. Direct class match for the toggle (vs_chatv9_emoji_button etc.)
-    const direct = doc.querySelector(
-      'button[class*="emoji"], [class*="emoji_button"], [class*="emoji-btn"], [class*="emojibtn"], [class*="emote"]'
-    );
-    if (direct) return direct;
-
-    // 2. Label/aria/title hints
-    const labeled = doc.querySelector(
-      '[title*="moji" i], [aria-label*="moji" i], [title*="mote" i], [aria-label*="mote" i]'
-    );
-    if (labeled) return labeled;
-
-    // 3. Any clickable whose class/label/glyph suggests an emoji toggle.
-    const candidates = doc.querySelectorAll(
-      'button, [role="button"], a, span[class*="emoji"], div[class*="emoji"], i[class*="emoji"], svg[class*="emoji"]'
-    );
-    for (const el of candidates) {
-      if (looksLikeEmojiToggle(el)) return el;
-    }
-    return null;
-  }
-
-  function findEmojiButton() {
-    const scope = chatInput
-      ? (chatInput.closest('[class*="chat"], form, [class*="footer"], [class*="input"]') || document.body)
-      : document.body;
-
-    const local = searchDocForEmojiButton(scope.nodeType === 9 ? scope : (scope.closest('body') ? scope : scope));
-    if (local) return local;
-
-    // Whole-document fallback (scope may have been too narrow).
-    const globalBtn = searchDocForEmojiButton(document);
-    if (globalBtn) return globalBtn;
-
-    // Chat inputs often live in an iframe with the picker. Search all
-    // same-origin frames too.
-    try {
-      for (const f of Array.from(document.querySelectorAll('iframe'))) {
-        const d = f.contentDocument;
-        if (!d) continue; // cross-origin, skip silently
-        const inFrame = searchDocForEmojiButton(d);
-        if (inFrame) return inFrame;
-      }
-    } catch (_) { /* ignore frame access errors */ }
-
-    return null;
-  }
-
-  // Wait until either emotes appear in the DOM, or timeout.
-  // Returns the parsed list (possibly empty).
-  function waitForDomEmotes(timeoutMs) {
-    return new Promise((resolve) => {
-      const start = Date.now();
-      const poll = () => {
-        const list = parseEmotesFromDOM();
-        if (list.length > 0 || Date.now() - start > timeoutMs) {
-          resolve(list);
-          return;
-        }
-        setTimeout(poll, 150);
-      };
-      poll();
-    });
-  }
-
-  // THE MAIN LOADER: virtually open the emoji picker, harvest the items,
-  // then close it again so the user never sees anything happen.
-  async function virtualLoadEmotesByClickingPicker() {
-    if (emotes.size > 0) return;
-    if (virtualClickAttempts >= VIRTUAL_CLICK_MAX_ATTEMPTS) return;
-    virtualClickAttempts += 1;
-    lastVirtualClickAt = Date.now();
-
-    // The chat UI may not be rendered yet; make sure we at least have the
-    // right document scope before searching for the emoji button.
-    tryInitInput();
-
-    const btn = findEmojiButton();
-    if (!btn) {
-      console.warn('[Vaughn Emotes] Virtual load: emoji picker button not found yet.');
-      scheduleVirtualEmoteLoad(); // retry later once the chat renders
-      return;
-    }
-
-    // Record page state so we can undo our interference.
-    const hadFocus = document.activeElement;
-
-    // Keep the picker invisible while we harvest it: hide ONLY elements
-    // that newly appear after the click (never the whole page — the old
-    // "anim killer" set visibility:hidden on <html>, which could stop the
-    // lazy rendering we were trying to trigger).
-    const beforeNodes = new WeakSet();
-    document.querySelectorAll('body *').forEach((el) => beforeNodes.add(el));
-    const hiddenForHarvest = [];
-    const suppressNewPopups = () => {
-      document.querySelectorAll('body *').forEach((el) => {
-        if (beforeNodes.has(el) || hiddenForHarvest.includes(el)) return;
-        const cs = getComputedStyle(el);
-        const pos = cs.position;
-        if ((pos === 'fixed' || pos === 'absolute') && el.offsetHeight > 40 && el.offsetWidth > 40) {
-          el.style.setProperty('visibility', 'hidden', 'important');
-          hiddenForHarvest.push(el);
-        }
-      });
-    };
-
-    function fullClickSequence(el) {
-      const doc = el.ownerDocument;
-      const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 0, top: 0 };
-      const x = rect.left + Math.max(rect.width / 2, 1);
-      const y = rect.top + Math.max(rect.height / 2, 1);
-      const base = { bubbles: true, cancelable: true, view: doc.defaultView, clientX: x, clientY: y };
-      if (typeof PointerEvent === 'function') {
-        el.dispatchEvent(new PointerEvent('pointerdown', { ...base, pointerId: 1, isPrimary: true }));
-      }
-      el.dispatchEvent(new MouseEvent('mousedown', base));
-      el.focus && el.focus({ preventScroll: true });
-      if (typeof PointerEvent === 'function') {
-        el.dispatchEvent(new PointerEvent('pointerup', { ...base, pointerId: 1, isPrimary: true }));
-      }
-      el.dispatchEvent(new MouseEvent('mouseup', base));
-      el.dispatchEvent(new MouseEvent('click', base));
-      // React/other frameworks sometimes listen for these too:
-      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
-    }
-
-    let harvestTimer = null;
-    try {
-      // Start watching for the popup a tick BEFORE clicking, then click.
-      fullClickSequence(btn);
-      harvestTimer = setInterval(suppressNewPopups, 50);
-      suppressNewPopups();
-
-      // Give the site time to render (or XHR-fill) the emoji list.
-      const list = await waitForDomEmotes(4000);
-
-      if (list.length > 0) {
-        storeEmotes(list);
-        console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes via virtual picker click.`);
-      } else {
-        console.warn(
-          '[Vaughn Emotes] Virtual picker click rendered no emote items.',
-          'Button matched was:', btn.tagName, btn.className || '(no class)',
-          '| Run window.__vaughnEmoteDiag() in this frame\'s console and send me the output.'
-        );
-        dumpEmojiDiagnostics();
-      }
-    } finally {
-      if (harvestTimer) clearInterval(harvestTimer);
-      hiddenForHarvest.forEach((el) => el.style.removeProperty('visibility'));
-
-      // Close the picker again: Escape, then toggle-click if still open.
-      const doc2 = btn.ownerDocument;
-      (doc2.activeElement || doc2.body).dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
-      );
-      if (parseEmotesFromDOM().length > 0) {
-        fullClickSequence(btn); // popup still open -> click the toggle to close it
-      }
-
-      if (hadFocus && typeof hadFocus.focus === 'function') hadFocus.focus({ preventScroll: true });
-    }
-
-    if (emotes.size === 0) scheduleVirtualEmoteLoad(); // one more chance later
   }
 
   // Generic parser: given a NodeList of candidate emoji-item elements,
@@ -349,6 +123,320 @@
   // Candidate selectors, most specific first. Vaughn's CSS classes carry a
   // version suffix (vs_chatv9_*), which changes over time — prefix/substring
   // selectors survive those renames, exact ones don't.
+  // ---------- debug helper ----------
+  // Dumps every "emoji-ish" element, the click-listener map near the chat
+  // input, and image src patterns, so we can see what the real markup is.
+  function dumpEmojiDiagnostics() {
+    try {
+      const info = {
+        frameUrl: location.href,
+        isTopFrame: window.top === window.self,
+        chatInputFound: !!findChatInput(),
+        emojiishElements: [],
+        clickablesNearInput: [],
+        imgSrcSamples: [],
+      };
+      document.querySelectorAll('*').forEach((el) => {
+        const hay = (
+          (typeof el.className === 'string' ? el.className : '') + ' ' +
+          (el.id || '') + ' ' +
+          (el.getAttribute('title') || '') + ' ' +
+          (el.getAttribute('aria-label') || '')
+        ).toLowerCase();
+        if (/emoji|emote|smile/.test(hay)) {
+          info.emojiishElements.push({
+            tag: el.tagName, id: el.id,
+            class: typeof el.className === 'string' ? el.className : '',
+            title: el.getAttribute('title'), aria: el.getAttribute('aria-label'),
+            children: el.children.length,
+          });
+        }
+      });
+      const input = findChatInput();
+      if (input) {
+        let scope = input.parentElement;
+        for (let i = 0; i < 5 && scope && scope !== document.body; i++) scope = scope.parentElement;
+        scope = scope || document.body;
+        scope.querySelectorAll('button, [role="button"], a, svg, i, span').forEach((el) => {
+          if (info.clickablesNearInput.length >= 30) return;
+          info.clickablesNearInput.push({
+            tag: el.tagName,
+            class: typeof el.className === 'string' ? el.className : String(el.className || ''),
+            title: el.getAttribute('title'), aria: el.getAttribute('aria-label'),
+            text: (el.textContent || '').trim().slice(0, 10),
+            hasClickListener: hasClickListener(el),
+          });
+        });
+      }
+      const seenSrc = new Set();
+      document.querySelectorAll('img').forEach((img) => {
+        const s = img.getAttribute('src') || '';
+        const dir = s.replace(/[^/]*$/, '');
+        if (!seenSrc.has(dir) && s) {
+          seenSrc.add(dir);
+          if (info.imgSrcSamples.length < 20) info.imgSrcSamples.push(s.slice(0, 140));
+        }
+      });
+      console.log('[Vaughn Emotes] DIAGNOSTICS:', JSON.stringify(info, null, 2));
+      return info;
+    } catch (err) {
+      console.warn('[Vaughn Emotes] diagnostics failed:', err);
+    }
+  }
+  try { window.__vaughnEmoteDiag = dumpEmojiDiagnostics; } catch (_) {}
+
+  // ---------- emoji-picker toggle discovery ----------
+
+  const EMOJI_GLYPH_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/u;
+
+  function emojiHintScore(el) {
+    if (!el || el === chatInput) return 0;
+    let score = 0;
+    const cls = ((el.className && String(el.className)) || '').toLowerCase();
+    const label = (
+      (el.getAttribute && (el.getAttribute('title') || el.getAttribute('aria-label'))) || ''
+    ).toLowerCase();
+    const text = (el.textContent || '').trim().toLowerCase();
+    if (/emoji|emote/.test(cls)) score += 3;
+    else if (/smile|face|grin/.test(cls)) score += 2;
+    if (/emoji|emote|smile|face/.test(label)) score += 3;
+    if (EMOJI_GLYPH_RE.test(text) && text.length <= 4) score += 2;
+    if (el.getAttribute && el.getAttribute('onclick')) score += 1;
+    return score;
+  }
+
+  function hasClickListener(el) {
+    // Recorded by our addEventListener hook (works for React root-delegated
+    // handlers too? No — those live on document/root; we also accept any
+    // element that is a plausible interactive control).
+    return clickListenerTargets.has(el) || !!(el.getAttribute && el.getAttribute('onclick'));
+  }
+
+  function searchDocForEmojiButton(scope) {
+    // `scope` may be a Document or an Element; normalize to a query root.
+    const root = (scope && typeof scope.querySelectorAll === 'function')
+      ? scope
+      : document;
+    const win = (root.defaultView) || window;
+    const candidates = root.querySelectorAll(
+      'button, [role="button"], a, span[class*="emoji"], div[class*="emoji"], i[class*="emoji"], svg[class*="emoji"], [class*="emoji_button"], [class*="emoji-btn"]'
+    );
+    let best = null, bestScore = 0;
+    let fallback = null, fallbackScore = 0;
+    for (const el of candidates) {
+      let s = emojiHintScore(el);
+      if (s === 0) {
+        // No emoji hint, but our addEventListener hook proves it is clickable
+        // and its class mentions chat/footer/input area -> weak candidate.
+        if (hasClickListener(el)) {
+          const cls = ((el.className && String(el.className)) || '').toLowerCase();
+          if (/chat|footer|input|send/.test(cls)) {
+            const fs = 1;
+            if (fs > fallbackScore) { fallbackScore = fs; fallback = el; }
+          }
+        }
+        continue;
+      }
+      if (hasClickListener(el)) s += 4;
+      // Prefer small clickable controls near the bottom of the viewport
+      // (chat footers), when layout info is available.
+      try {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && r.bottom > (win.innerHeight || 800) * 0.5) s += 1;
+      } catch (_) {}
+      if (s > bestScore) { bestScore = s; best = el; }
+    }
+    return best || fallback;
+  }
+
+  function findEmojiButton() {
+    const scope = chatInput
+      ? (chatInput.closest('[class*="chat"], form, [class*="footer"], [class*="input"]') || document.body)
+      : document.body;
+    const local = searchDocForEmojiButton(scope.ownerDocument === document ? scope : document);
+    if (local) return local;
+    const globalBtn = searchDocForEmojiButton(document);
+    if (globalBtn) return globalBtn;
+    // Same-origin child frames (chat may live in an iframe whose document
+    // this script also runs in — but as a belt-and-braces measure, look too).
+    try {
+      for (const f of Array.from(document.querySelectorAll('iframe'))) {
+        hookDocument(f.contentDocument); // make sure its listeners get recorded
+        const inFrame = f.contentDocument && searchDocForEmojiButton(f.contentDocument);
+        if (inFrame) return inFrame;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function fullClickSequence(el) {
+    const doc = el.ownerDocument || document;
+    const Win = (doc && doc.defaultView) || window;
+    const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 0, top: 0, width: 2, height: 2 };
+    const x = rect.left + Math.max(rect.width / 2, 1);
+    const y = rect.top + Math.max(rect.height / 2, 1);
+    const base = { bubbles: true, cancelable: true, view: Win, clientX: x, clientY: y };
+    try {
+      if (typeof Win.PointerEvent === 'function') {
+        el.dispatchEvent(new Win.PointerEvent('pointerdown', { ...base, pointerId: 1, isPrimary: true }));
+      }
+      el.dispatchEvent(new Win.MouseEvent('mousedown', base));
+      if (typeof Win.PointerEvent === 'function') {
+        el.dispatchEvent(new Win.PointerEvent('pointerup', { ...base, pointerId: 1, isPrimary: true }));
+      }
+      el.dispatchEvent(new Win.MouseEvent('mouseup', base));
+      el.dispatchEvent(new Win.MouseEvent('click', base));
+    } catch (_) {
+      // Ultimate fallback: native .click()
+      try { el.click(); } catch (_) {}
+    }
+  }
+
+  // React-style props discovery: for a rendered element, find its internal
+  // instance key (__reactFiber$xxx / __reactInternalInstance$xxx), walk up
+  // to the nearest host component and collect every string prop that looks
+  // like an emoji name (short, no spaces). Used as a last-resort harvest
+  // when neither class selectors nor title attributes match anything.
+  function harvestFromReactFiber(maxItems) {
+    const results = [];
+    const seen = new Set();
+    let rootsScanned = 0;
+    const els = document.querySelectorAll('body *');
+    for (const el of els) {
+      if (results.length >= (maxItems || 400)) break;
+      if (rootsScanned > 60) break; // don't scan the whole tree forever
+      let fiberKey = null;
+      for (const k of Object.keys(el)) {
+        if (k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')) { fiberKey = k; break; }
+      }
+      if (!fiberKey) continue;
+      rootsScanned++;
+      let fiber = el[fiberKey];
+      // walk up to a component with interesting props
+      let hops = 0;
+      while (fiber && hops < 12) {
+        const props = fiber.memoizedProps || fiber.pendingProps;
+        if (props && typeof props === 'object') {
+          for (const key of ['title', 'name', 'label', 'text', 'emoji', 'emote']) {
+            const v = props[key];
+            if (typeof v === 'string' && v.length > 0 && v.length <= 32 && !/\s/.test(v)) {
+              const name = parseEmoteName(v);
+              if (name && !seen.has(name.toLowerCase())) {
+                seen.add(name.toLowerCase());
+                results.push({ id: '', name, filename: '', width: 60, height: 60 });
+              }
+            }
+          }
+          // arrays of emote objects: [{id, name/title}, ...]
+          for (const val of Object.values(props)) {
+            if (Array.isArray(val) && val.length >= 5 && val.every(x => x && typeof x === 'object')) {
+              for (const obj of val) {
+                const nm = obj.name || obj.title || obj.label;
+                if (typeof nm === 'string' && nm.length && nm.length <= 32) {
+                  const name = parseEmoteName(nm);
+                  if (name && !seen.has(name.toLowerCase())) {
+                    seen.add(name.toLowerCase());
+                    results.push({ id: String(obj.id || ''), name, filename: '', width: 60, height: 60 });
+                  }
+                }
+              }
+            }
+          }
+        }
+        fiber = fiber.return;
+        hops++;
+      }
+    }
+    return results;
+  }
+
+  // Wait until either emotes appear in the DOM, or timeout.
+  function waitForDomEmotes(timeoutMs) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const poll = () => {
+        const list = parseEmotesFromDOM();
+        if (list.length > 0 || Date.now() - start > timeoutMs) { resolve(list); return; }
+        setTimeout(poll, 150);
+      };
+      poll();
+    });
+  }
+
+  // THE MAIN LOADER: virtually open the emoji picker, harvest items, close it.
+  async function virtualLoadEmotesByClickingPicker() {
+    if (emotes.size > 0) return;
+    if (virtualClickAttempts >= VIRTUAL_CLICK_MAX_ATTEMPTS) {
+      console.warn('[Vaughn Emotes] Gave up after ' + virtualClickAttempts + ' virtual picker attempts.');
+      return;
+    }
+    virtualClickAttempts += 1;
+    lastVirtualClickAt = Date.now();
+
+    tryInitInput();
+
+    const btn = findEmojiButton();
+    if (!btn) {
+      console.warn(`[Vaughn Emotes] Virtual load attempt ${virtualClickAttempts}: emoji picker button not found yet.`);
+      scheduleVirtualEmoteLoad(3000);
+      return;
+    }
+    console.log('[Vaughn Emotes] Virtual click target:', btn.tagName, btn.className || '(no class)',
+                '| listener:', hasClickListener(btn) ? 'yes' : 'NO');
+
+    const hadFocus = document.activeElement;
+
+    // Hide ONLY popups that newly appear after the click, so harvesting is
+    // invisible. Never touch <html>/<body> (the old page-wide visibility
+    // rule broke lazy rendering).
+    const beforeNodes = new WeakSet();
+    document.querySelectorAll('body *').forEach((el) => beforeNodes.add(el));
+    const hiddenForHarvest = [];
+    const suppressNewPopups = () => {
+      document.querySelectorAll('body *').forEach((el) => {
+        if (beforeNodes.has(el) || hiddenForHarvest.includes(el)) return;
+        const cs = getComputedStyle(el);
+        if ((cs.position === 'fixed' || cs.position === 'absolute') &&
+            el.offsetHeight > 40 && el.offsetWidth > 40) {
+          el.style.setProperty('visibility', 'hidden', 'important');
+          hiddenForHarvest.push(el);
+        }
+      });
+    };
+
+    let harvestTimer = null;
+    try {
+      fullClickSequence(btn);
+      harvestTimer = setInterval(suppressNewPopups, 50);
+      suppressNewPopups();
+
+      const list = await waitForDomEmotes(4000);
+      if (list.length > 0) {
+        storeEmotes(list);
+        console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes via virtual picker click.`);
+      } else {
+        console.warn(
+          `[Vaughn Emotes] Virtual picker click (attempt ${virtualClickAttempts}/${VIRTUAL_CLICK_MAX_ATTEMPTS}) rendered no emote items.`
+        );
+        dumpEmojiDiagnostics();
+      }
+    } finally {
+      if (harvestTimer) clearInterval(harvestTimer);
+      hiddenForHarvest.forEach((el) => el.style.removeProperty('visibility'));
+      // Close the picker again: Escape, then toggle-click if still open.
+      const doc2 = btn.ownerDocument || document;
+      try {
+        (doc2.activeElement || doc2.body).dispatchEvent(
+          new ((doc2.defaultView || window).KeyboardEvent)('keydown', { key: 'Escape', bubbles: true })
+        );
+      } catch (_) {}
+      if (parseEmotesFromDOM().length > 0) fullClickSequence(btn);
+      if (hadFocus && typeof hadFocus.focus === 'function') hadFocus.focus({ preventScroll: true });
+    }
+
+    if (emotes.size === 0) scheduleVirtualEmoteLoad(3000);
+  }
+
   const EMOTE_ITEM_SELECTORS = [
     '.vs_chatv9_emoji_item',
     '[class*="emoji_item"]',
@@ -409,7 +497,15 @@
         return parsed;
       }
     }
-    return parseEmotesGenericFromDOM();
+    const generic = parseEmotesGenericFromDOM();
+    if (generic.length > 0) return generic;
+    // Final resort: React fiber props (survives any CSS rename / missing titles).
+    const fiber = harvestFromReactFiber();
+    if (fiber.length >= 5) {
+      console.log(`[Vaughn Emotes] React fiber harvest: ${fiber.length} emotes`);
+      return fiber;
+    }
+    return [];
   }
 
   // Parse the page HTML WITHOUT relying on any class name at all:
@@ -659,6 +755,11 @@
     // The chat UI may render late or be replaced; watch for it.
     let domParseThrottle = 0;
     observer = new MutationObserver(() => {
+      // Hook any same-origin iframes that appeared after load, so their
+      // addEventListener('click') calls are recorded too.
+      try {
+        document.querySelectorAll('iframe').forEach((f) => hookDocument(f.contentDocument));
+      } catch (_) {}
       if (!chatInput || !document.contains(chatInput)) {
         chatInput = null;
         tryInitInput();
