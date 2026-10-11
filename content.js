@@ -15,7 +15,6 @@
 (() => {
   'use strict';
 
-  const DOM_URL = 'https://vaughn.live';
   const TRIGGER_CHARS = [':', '!'];       // characters that start a query
   const MAX_SUGGESTIONS = 12;
   const MIN_QUERY_LEN = 1;                // show suggestions after 1 char
@@ -52,14 +51,15 @@
 
   // ---------- emote loading ----------
 
-  function parseEmotesFromDOM() {
-    const emoteItems = document.querySelectorAll('.vs_chatv9_emoji_item');
-    if (emoteItems.length === 0) return [];
-
-    return Array.from(emoteItems).map((item) => {
+  // Generic parser: given a NodeList of candidate emoji-item elements,
+  // extract {id, name, ...} from title + onclick, whatever the exact
+  // class name or attribute order happens to be.
+  function extractEmotes(items) {
+    return Array.from(items).map((item) => {
       const title = item.getAttribute('title') || '';
-      const onclick = item.getAttribute('onclick') || '';
-      const idMatch = onclick.match(/insertEmoji\(['"]([^'"]+)['"]\s*,/);
+      // onclick may be an attribute OR a property set by JS (no attribute)
+      const onclick = item.getAttribute('onclick') || String(item.onclick || '');
+      const idMatch = onclick.match(/insertEmoji\(\s*['"]([^'"]+)['"]\s*,/);
       const img = item.querySelector('img');
       const src = img ? img.getAttribute('src') : '';
 
@@ -73,22 +73,71 @@
     }).filter((e) => e.name);
   }
 
+  // Candidate selectors, most specific first. Vaughn's CSS classes carry a
+  // version suffix (vs_chatv9_*), which changes over time — prefix/substring
+  // selectors survive those renames, exact ones don't.
+  const EMOTE_ITEM_SELECTORS = [
+    '.vs_chatv9_emoji_item',
+    '[class*="emoji_item"]',
+    '[class*="emoji"][class*="item"]',
+    '[class*="emote"]',
+  ];
+
+  function parseEmotesFromDOM() {
+    for (const sel of EMOTE_ITEM_SELECTORS) {
+      const items = document.querySelectorAll(sel);
+      if (items.length === 0) continue;
+      const parsed = extractEmotes(items);
+      if (parsed.length > 0) {
+        console.log(`[Vaughn Emotes] DOM parse: ${parsed.length} emotes via "${sel}"`);
+        return parsed;
+      }
+    }
+    return [];
+  }
+
+  // Parse the page HTML WITHOUT relying on any class name at all:
+  // find every insertEmoji(...) call site, then walk the tag backwards
+  // to pick up its title="..." / data-title="..." attributes.
+  function parseEmotesFromHtmlString(html) {
+    const results = [];
+    const seen = new Set();
+    const callRe = /insertEmoji\(\s*(?:&#0?39;|&apos;|'|")([^'"&]+)(?:&#0?39;|&apos;|'|")\s*,/g;
+    let m;
+    while ((m = callRe.exec(html)) !== null) {
+      const id = m[1];
+      // Find the start of the <tag ...> that contains this onclick
+      const tagStart = html.lastIndexOf('<', m.index);
+      if (tagStart === -1) continue;
+      const tagStr = html.slice(tagStart, m.index + m[0].length + 200);
+      const titleMatch =
+        tagStr.match(/title=(?:&#0?39;|&apos;|'|")([^'"&]*)/) ||
+        tagStr.match(/data-(?:emote-)?title=(?:&#0?39;|&apos;|'|")([^'"&]*)/);
+      if (!titleMatch) continue;
+      const name = parseEmoteName(titleMatch[1]);
+      if (!name || seen.has(name.toLowerCase())) continue;
+      seen.add(name.toLowerCase());
+      results.push({ id, name, filename: '', width: 60, height: 60 });
+    }
+    return results;
+  }
+
   async function fetchEmotesHTML() {
     try {
-      const res = await fetch(DOM_URL, { credentials: 'include' });
+      const res = await fetch(window.location.origin + window.location.pathname, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const html = await res.text();
-
-      // Match each emoji item div, capturing BOTH title and onclick so
-      // each emote keeps its OWN id (the old code reused one global match).
-      const re = /<div class="vs_chatv9_emoji_item" onclick="([^"]*)"[^>]*title="([^"]*)"/g;
-      const results = [];
-      let m;
-      while ((m = re.exec(html)) !== null) {
-        const onclick = m[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-        const idMatch = onclick.match(/insertEmoji\(['"]([^'"]+)['"]\s*,/);
-        const name = parseEmoteName(m[2]);
-        if (!name) continue;
-        results.push({ id: idMatch ? idMatch[1] : '', name, filename: '', width: 60, height: 60 });
+      const results = parseEmotesFromHtmlString(html);
+      if (results.length === 0) {
+        console.warn(
+          '[Vaughn Emotes] fetch fallback found no insertEmoji() calls in HTML.',
+          'If you see this in the WEB CONSOLE (not the add-on console), Cloudflare blocked the request.'
+        );
+      } else {
+        console.log(`[Vaughn Emotes] HTML fallback: ${results.length} emotes`);
       }
       return results;
     } catch (err) {
@@ -103,12 +152,15 @@
     }
   }
 
+  let loadedFromHtml = false;
+
   async function loadEmotes() {
     // Prefer live DOM (the emoji picker may already be rendered);
     // fall back to fetching the page HTML.
     let list = parseEmotesFromDOM();
-    if (list.length === 0) {
+    if (list.length === 0 && !loadedFromHtml) {
       list = await fetchEmotesHTML();
+      if (list.length > 0) loadedFromHtml = true;
     }
     storeEmotes(list);
     console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes`);
