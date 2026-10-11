@@ -1,0 +1,21 @@
+{
+  "manifest_version": 2,
+  "name": "Vaughn Emote Autocomplete",
+  "version": "1.0.0",
+  "description": "Autocomplete emotes in vaughn.live chat by typing :name or !name.",
+  "browser_action": {
+    "default_title": "Vaughn Emote Autocomplete"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://vaughn.live/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "permissions": [
+    "https://vaughn.live/*"
+  ]
+}

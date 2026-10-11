@@ -1,0 +1,23 @@
+#vaughn-emote-dropdown {
+  position: fixed;
+  z-index: 2147483647;
+  background: #1e1e2e;
+  border: 1px solid #444;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  max-height: 280px;
+  overflow-y: auto;
+  font-family: sans-serif;
+  font-size: 14px;
+  color: #eee;
+}
+
+.vaughn-emote-item {
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.vaughn-emote-item:hover,
+.vaughn-emote-active {
+  background: #3b3b5c;
+}
