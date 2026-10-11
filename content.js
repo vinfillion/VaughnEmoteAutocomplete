@@ -228,10 +228,20 @@
   function looksLikeEmoteItem(item, onclick) {
     // Confirmed picker item if it inserts an emote on click.
     if (/insertEmoji\s*\(/.test(onclick)) return true;
-    const cls = (typeof item.className === 'string' ? item.className : '') +
-                ' ' + (item.id || '');
-    if (NON_EMOTE_CLASS_RE.test(cls)) return false;
+    // Check the element itself AND its ancestor chain: trending stream rows
+    // nest title-bearing children inside vs_v9_content_menu_item containers,
+    // so validating only the closest [title] holder let them slip through.
+    for (let node = item; node && node.nodeType === 1; node = node.parentElement) {
+      const cls = (typeof node.className === 'string' ? node.className : '') +
+                  ' ' + (node.id || '');
+      if (NON_EMOTE_CLASS_RE.test(cls)) return false;
+    }
     if (NON_EMOTE_ONCLICK_RE.test(onclick)) return false;
+    // Ancestor onclicks too (hover handlers live on the row container).
+    for (let node = item; node && node.nodeType === 1; node = node.parentElement) {
+      const ancOnclick = node.getAttribute && node.getAttribute('onclick');
+      if (ancOnclick && NON_EMOTE_ONCLICK_RE.test(ancOnclick)) return false;
+    }
     // Unconfirmed items must at least contain a small image, like every
     // real emote does. Stream-menu rows contain big preview thumbnails and
     // profile avatars instead.
@@ -240,6 +250,14 @@
     const w = parseInt(img.getAttribute('width'), 10) || img.naturalWidth || 0;
     const h = parseInt(img.getAttribute('height'), 10) || img.naturalHeight || 0;
     if (w > 128 || h > 128) return false; // large media -> not an emote icon
+    // Name-shape sanity: real emote names are one short token (optionally
+    // wrapped in parens), e.g. "(nowayy)". Stream titles like
+    // "thejedshed - winter approacheth! ~ live from Kansas City" are long,
+    // multi-word, and contain separators — reject those for unconfirmed items.
+    const title = (item.getAttribute && item.getAttribute('title')) || '';
+    if (/\s{2,}|[~#&]|\B - \B/.test(title)) return false;
+    const bare = parseEmoteName(title.trim());
+    if (/[\s]/.test(bare) || bare.length > 32) return false;
     return true;
   }
 
