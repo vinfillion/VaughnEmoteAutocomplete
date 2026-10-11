@@ -147,22 +147,35 @@
   // Parse emote name - remove surrounding parentheses/brackets
   const parseEmoteName = (name) => (name || '').replace(/^[\(\)\[\]:]+|[\(\)\[\]:]+$/g, '').trim();
 
+  function isUsable(el) {
+    return !!(el && (el.tagName === 'TEXTAREA' || el.isContentEditable ||
+      (el.tagName === 'INPUT' && !/hidden|checkbox|radio|submit|button|image/i.test(el.type))));
+  }
+
   function findChatInputInDoc(doc) {
     const selectors = [
+      // CONFIRMED markup from the user (vaughn.live chatv9):
+      // <textarea id="vs_chatv9_input_box" class="vs_chatv9_input_box" ...>
+      '#vs_chatv9_input_box',
+      'textarea.vs_chatv9_input_box',
+      'textarea[id*="chat" i]',
+      'textarea[class*="chat" i]',
+      'textarea[placeholder*="Type" i]',
       'input.vs_chatv9_input',
       '.vs_chatv9_footer input[type="text"]',
       'input[placeholder*="chat" i]',
       'input[placeholder*="message" i]',
       'input[placeholder*="Send" i]',
+      '[contenteditable="true"]',
       'textarea',
       'input[type="text"]',
     ];
     for (const sel of selectors) {
-      let el = null;
-      try { el = doc.querySelector(sel); } catch (_) { continue; }
-      // jsdom/devtools: offsetParent may be null even for real inputs in
-      // detached layouts, so accept the element either way if it's in a doc.
-      if (el) return el;
+      let els = [];
+      try { els = doc.querySelectorAll(sel); } catch (_) { continue; }
+      // Return the first *usable* match — an early selector like a generic
+      // class can otherwise hit a hidden search box and shadow the textarea.
+      for (const el of els) if (isUsable(el)) return el;
     }
     return null;
   }
@@ -1394,6 +1407,8 @@
   // ---------- events ----------
 
   function attachEvents(input) {
+    if (input.__vaughnEmoteBound) return; // never double-bind
+    input.__vaughnEmoteBound = true;
     input.addEventListener('input', showAutocomplete);
     input.addEventListener('keyup', (e) => {
       // Arrow navigation when dropdown open
@@ -1427,6 +1442,22 @@
     });
     input.addEventListener('blur', () => setTimeout(hideAutocomplete, 150));
     input.addEventListener('click', showAutocomplete);
+    // The site's own handlers are inline attributes:
+    //   onkeyup="return vs_chatv9.submitChat(event, true)"
+    //   onkeydown="return vs_chatv9.submitChat(event, false)"
+    // Inline attribute handlers run BEFORE addEventListener listeners for the
+    // same event. If submitChat() returns false it cancels the default action,
+    // which means NO `input` event is ever fired while typing — our primary
+    // trigger would silently never run. So we also listen to raw keypress and
+    // poll the value on a microtask after each keystroke as a safety net.
+    input.addEventListener('keypress', () => setTimeout(showAutocomplete, 0));
+    let lastValue = null;
+    setInterval(() => {
+      try {
+        const v = chatInput ? chatInput.value : null;
+        if (v !== lastValue) { lastValue = v; showAutocomplete(); }
+      } catch (_) {}
+    }, 200);
   }
 
   function buildUI() {
@@ -1448,12 +1479,21 @@
   }
 
   function tryInitInput() {
+    // If the element we previously bound is gone (site re-rendered the chat),
+    // drop it so we can discover and bind the new one.
+    if (chatInput && !document.contains(chatInput) &&
+        !(chatInput.ownerDocument && chatInput.ownerDocument.defaultView)) {
+      chatInput = null;
+    }
     if (chatInput && document.contains(chatInput)) return true;
-    chatInput = findChatInput();
-    if (chatInput) {
+    const el = findChatInput();
+    if (el) {
+      chatInput = el;
       buildUI();
       attachEvents(chatInput);
-      console.log('[Vaughn Emotes] Chat input found, autocomplete ready.');
+      console.log('[Vaughn Emotes] Chat input found:',
+        `${chatInput.tagName.toLowerCase()}#${chatInput.id || '(no id)'}`,
+        '- autocomplete ready.');
       return true;
     }
     return false;
