@@ -4,3 +4,7 @@ package-lock.json
 test_*.js
 debug_*.js
 *.log
+
+# Build artifacts
+*.xpi
+*.zip
