@@ -26,6 +26,37 @@
   let currentMatches = [];
   let observer = null;
 
+  // CRITICAL: isTopFrame() returns TRUE when we are inside a frame (the
+  // chat iframe). Those frames never get the CSS injected by the manifest
+  // ("css" is only applied to the top document), so we inject it ourselves.
+  function ensureStyleInThisDocument(doc) {
+    doc = doc || document;
+    try {
+      if (doc.getElementById('vaughn-emote-style')) return;
+      const link = document.querySelector('link[href*="content.css"]') ||
+                   doc.querySelector('link[href*="content.css"]');
+      const style = doc.createElement('style');
+      style.id = 'vaughn-emote-style';
+      if (link) {
+        fetch(link.href).then((r) => r.text()).then((t) => { style.textContent = t; }).catch(() => {});
+      } else {
+        style.textContent = [
+          '#vaughn-emote-dropdown{position:fixed;z-index:2147483647;background:#1e1e2e;border:1px solid #444;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.4);max-height:280px;overflow-y:auto;font-family:sans-serif;font-size:14px;color:#eee;display:none}',
+          '.vaughn-emote-item{padding:6px 10px;cursor:pointer}',
+          '.vaughn-emote-item:hover,.vaughn-emote-active{background:#3b3b5c}',
+        ].join('\n');
+      }
+      (doc.head || doc.documentElement).appendChild(style);
+    } catch (_) {}
+  }
+
+  // The site pre-renders a small subset of emotes (e.g. "recently used") in
+  // the initial DOM. We must NOT stop loading after finding those — keep
+  // virtually opening the picker until we have the full list.
+  const MIN_FULL_LIST = 50;               // below this, assume partial list
+  let pickerEverOpened = false;           // user or virtual click rendered items
+  let lastDomParseAt = 0;
+
   // The emoji list is NOT in the initial HTML — it only exists once the
   // user opens the emoji picker. Instead of virtually clicking the picker
   // button (which fails when the click handler is React-attached, or when
@@ -68,17 +99,20 @@
   // (all_frames:true), so the child posts its harvested emotes up to us via
   // window.postMessage, and we merge them into our store.
   const MSG_TAG = 'vaughn-emote-autocomplete';
-  function isTopFrame() { try { return window.top !== window.self; } catch (_) { return false; } }
+  function isTopFrame() { try { return window.top === window.self; } catch (_) { return true; } }
   const pendingChildEmotes = [];   // buffered messages received before store ready
 
   window.addEventListener('message', (ev) => {
     if (ev.source === window) return;                 // only from child frames
     const d = ev.data;
     if (!d || d.__vaughnEmoteMsg !== MSG_TAG || !Array.isArray(d.emotes)) return;
-    if (emotes.size > 0) return;                       // already have a list
+    // Merge child-frame emotes into our store. Don't skip just because we
+    // already have some — what we have may be only the pre-rendered subset.
     if (d.emotes.length > 0) {
+      const before = emotes.size;
       storeEmotes(d.emotes);
-      console.log(`[Vaughn Emotes] Received ${emotes.size} emotes from child frame (${d.frameUrl || 'cross-origin'}).`);
+      console.log(`[Vaughn Emotes] Received ${d.emotes.length} emotes from child frame (${d.frameUrl || 'cross-origin'}); total now ${emotes.size} (+${emotes.size - before}).`);
+      if (emotes.size >= MIN_FULL_LIST) maybeBuildDropdown();
     } else {
       pendingChildEmotes.push(d);                      // frame opened but rendered nothing yet
     }
@@ -97,11 +131,13 @@
   let virtualRefreshScheduled = false;
   let lastVirtualClickAt = 0;
   const VIRTUAL_CLICK_COOLDOWN_MS = 5 * 1000;   // retry quickly, capped by MAX_ATTEMPTS
-  const VIRTUAL_CLICK_MAX_ATTEMPTS = 8;
+  const VIRTUAL_CLICK_MAX_ATTEMPTS = 30;        // large list (~1600) may render in chunks
   let virtualClickAttempts = 0;
 
   function scheduleVirtualEmoteLoad(delayMs) {
-    if (virtualRefreshScheduled || emotes.size > 0) return;
+    // Continue loading while we have nothing OR only a partial (pre-rendered)
+    // subset of the emote list.
+    if (virtualRefreshScheduled || emotes.size >= MIN_FULL_LIST) return;
     if (Date.now() - lastVirtualClickAt < VIRTUAL_CLICK_COOLDOWN_MS) return;
     virtualRefreshScheduled = true;
     setTimeout(() => {
@@ -113,21 +149,58 @@
   // Parse emote name - remove surrounding parentheses/brackets
   const parseEmoteName = (name) => (name || '').replace(/^[\(\)\[\]:]+|[\(\)\[\]:]+$/g, '').trim();
 
-  function findChatInput() {
-    // Most specific selectors first; fall back to generic ones.
+  function isUsable(el) {
+    return !!(el && (el.tagName === 'TEXTAREA' || el.isContentEditable ||
+      (el.tagName === 'INPUT' && !/hidden|checkbox|radio|submit|button|image/i.test(el.type))));
+  }
+
+  function findChatInputInDoc(doc) {
     const selectors = [
+      // CONFIRMED markup from the user (vaughn.live chatv9):
+      // <textarea id="vs_chatv9_input_box" class="vs_chatv9_input_box" ...>
+      '#vs_chatv9_input_box',
+      'textarea.vs_chatv9_input_box',
+      'textarea[id*="chat" i]',
+      'textarea[class*="chat" i]',
+      'textarea[placeholder*="Type" i]',
       'input.vs_chatv9_input',
       '.vs_chatv9_footer input[type="text"]',
       'input[placeholder*="chat" i]',
       'input[placeholder*="message" i]',
       'input[placeholder*="Send" i]',
+      '[contenteditable="true"]',
       'textarea',
       'input[type="text"]',
     ];
     for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el && el.offsetParent !== null) return el; // visible elements only
+      let els = [];
+      try { els = doc.querySelectorAll(sel); } catch (_) { continue; }
+      // Return the first *usable* match — an early selector like a generic
+      // class can otherwise hit a hidden search box and shadow the textarea.
+      for (const el of els) if (isUsable(el)) return el;
     }
+    return null;
+  }
+
+  function findChatInput() {
+    // Search our own document first, then any registered same-origin iframe
+    // documents (the chat may live entirely inside one).
+    const local = findChatInputInDoc(document);
+    if (local) return local;
+    for (const doc of foreignDocs) {
+      const el = findChatInputInDoc(doc);
+      if (el) return el;
+    }
+    try {
+      const frames = document.querySelectorAll('iframe');
+      for (const f of frames) {
+        let cd = null;
+        try { cd = f.contentDocument; } catch (_) {}
+        if (!cd) continue;
+        const el = findChatInputInDoc(cd);
+        if (el) { registerForeignDoc(cd); return el; }
+      }
+    } catch (_) {}
     return null;
   }
 
@@ -320,6 +393,16 @@
   }
 
   function findEmojiButton() {
+    // PRIORITY 1: the confirmed real toggle button, present in every frame's
+    // DOM from page load (the <img class="vs_chatv9_input_emojis"> icon).
+    // The old heuristic below sometimes matched a wrong emoji-ish element;
+    // this exact selector makes that impossible.
+    for (const doc of allReachableDocs()) {
+      try {
+        const exact = findEmojiToggleButton(doc);
+        if (exact) return exact;
+      } catch (_) {}
+    }
     // Search EVERY reachable same-origin document: our own, the chat input's
     // owner document, any iframe that registered itself with us, and child
     // iframes we can walk into directly. A plain document.querySelector in
@@ -431,17 +514,286 @@
     });
   }
 
+  // ---- Site API toggle: vs_chatv9.toggleEmojisBox() -----------------------
+  // The site exposes a global object/function that opens/closes the emoji
+  // picker. CRITICAL: Firefox content scripts run in an ISOLATED WORLD —
+  // they share the DOM with the page but NOT its JavaScript globals. That's
+  // exactly why typing `vs_chatv9.toggleEmojisBox()` in DevTools (which runs
+  // in the PAGE world) works, while our earlier `Win.vs_chatv9` check always
+  // failed ("not reachable"). The fix is a real page-world script:
+  //   1. We write a small loader file (page_api_loader.js) at build/install
+  //      time via browser.runtime.getURL + a blob-free <script src> tag —
+  //      Firefox allows web-accessible resources this way even under the
+  //      site's CSP for extension-origin URLs... but vaughn.live's CSP may
+  //      block inline AND external scripts, so we ALSO try
+  //      "world": "MAIN" execution via scripting.executeScript (MV3) or,
+  //      since this manifest is MV2, the classic technique below.
+  //   2. Classic MV2 technique that survives most CSPs: dispatching a
+  //      CustomEvent FROM the page world requires code in the page world,
+  //      so instead we hook the *DOM*: the page's own toggle button
+  //      (`img.vs_chatv9_input_emojis`) has a real click listener attached
+  //      by the site. A synthetic full-pointer click sequence on THAT exact
+  //      element invokes the site's own handler, which calls
+  //      vs_chatv9.toggleEmojisBox() internally. This is equivalent to the
+  //      user clicking it, and unlike our old heuristic it never targets a
+  //      wrong element because we select it by its actual class/src.
+  //   3. As a bonus, we also attempt a direct page-world call via a
+  //      dynamically inserted <script> (works when the site has no strict
+  //      CSP) and remember success so future toggles skip the click path.
+  let toggleOpenState = false; // only tracked when we drive it via the API
+  let pageWorldCallOk = false; // direct window-vs_chatv9 call worked once
+  let cspBlockedInline = false;
+
+  // The REAL emoji toggle button, per the user-confirmed markup:
+  //   <img src="//cdn.vaughnsoft.net/img/svg/emoji.svg" class="vs_chatv9_input_emojis">
+  function findEmojiToggleButton(doc) {
+    const selectors = [
+      'img.vs_chatv9_input_emojis',                       // confirmed class
+      'img[src*="/img/svg/emoji.svg"]',                   // confirmed src
+      '.vs_chatv9_input_emojis',                          // wrapper div/li
+      '[class*="vs_chatv9"][class*="emojis"]',            // any chat emojis el
+    ];
+    for (const sel of selectors) {
+      try {
+        const el = doc.querySelector(sel);
+        if (el) return el;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // Try to call the site function directly from the PAGE world by injecting
+  // a script tag. Returns a promise resolving true/false. Safe to fail.
+  function tryPageWorldCall(doc) {
+    return new Promise((resolve) => {
+      if (cspBlockedInline) { resolve(false); return; }
+      try {
+        const Win = doc.defaultView;
+        if (!Win) { resolve(false); return; }
+        const RESULT_EVT = 'vaughn-emote-api-result';
+        const REQ_EVT = 'vaughn-emote-api-request';
+        let settled = false;
+        const onResult = (e) => {
+          // Only trust results coming from the page world (our isolated
+          // listener sees events dispatched by injected page scripts too).
+          settled = true;
+          resolve(!!(e && e.detail && e.detail.ok));
+        };
+        Win.addEventListener(RESULT_EVT, onResult, { once: true });
+        const s = doc.createElement('script');
+        s.onload = () => {};
+        s.onerror = () => { cspBlockedInline = true; };
+        // NOTE: the whole body is built with array-join so we never have to
+        // juggle nested quote escaping (a previous version produced invalid
+        // JS here, which silently broke the page-world bridge).
+        s.textContent = [
+          '(function(){',
+          '  var respond=function(ok){',
+          '    try{ window.dispatchEvent(new CustomEvent("' + RESULT_EVT + '", {detail:{ok:ok}})); }catch(e){}',
+          '  };',
+          '  document.addEventListener("' + REQ_EVT + '", function(){',
+          '    var ok=false;',
+          '    try{ if(window.vs_chatv9 && typeof window.vs_chatv9.toggleEmojisBox==="function"){ window.vs_chatv9.toggleEmojisBox(); ok=true; } }catch(e){}',
+          '    respond(ok);',
+          '  }, false);',
+          // Fire a result for the request that was dispatched while this
+          // script was still parsing (jsdom/CSP timing safety).
+          '  if(window.__vaughnEmotePendingRequest){ window.__vaughnEmotePendingRequest=false;',
+          '    var ok2=false;',
+          '    try{ if(window.vs_chatv9 && typeof window.vs_chatv9.toggleEmojisBox==="function"){ window.vs_chatv9.toggleEmojisBox(); ok2=true; } }catch(e){}',
+          '    respond(ok2);',
+          '  }',
+          '})();',
+        ].join('\n');
+        (doc.body || doc.documentElement).appendChild(s);
+        s.remove();
+        // Ask the injected page-world listener to perform the toggle. The
+        // flag lets a late-parsing page script catch the request anyway.
+        try { Win.__vaughnEmotePendingRequest = true; } catch (_) {}
+        Win.dispatchEvent(new Win.Event(REQ_EVT));
+        setTimeout(() => {
+          if (!settled) {
+            Win.removeEventListener(RESULT_EVT, onResult);
+            // No response => inline script was blocked (CSP) or silent.
+            cspBlockedInline = true;
+            resolve(false);
+          }
+        }, 400);
+      } catch (_) {
+        cspBlockedInline = true;
+        resolve(false);
+      }
+    });
+  }
+
+  // Is the picker currently rendered/open in any reachable document?
+  function pickerIsOpen() {
+    for (const d of allReachableDocs()) {
+      try {
+        if (d.querySelector('.vs_chatv9_emoji_item, [class*="emoji_item"]')) return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  // Call vs_chatv9.toggleEmojisBox() ONLY when that will OPEN the picker.
+  // Returns: 'opened' | 'closed' | 'noop'. The old code toggled blindly, so
+  // depending on the picker's current state the same call could close it
+  // immediately after opening — a plausible reason your manual console call
+  // worked while ours appeared not to.
+  async function ensurePickerOpened(doc) {
+    const Win = doc && doc.defaultView;
+    if (!Win) return 'noop';
+    const wasOpen = pickerIsOpen();
+    let method = null;
+    // Path A: Firefox-only privileged access to the page's JS objects.
+    try {
+      if (Win.wrappedJSObject && Win.wrappedJSObject.vs_chatv9 &&
+          typeof Win.wrappedJSObject.vs_chatv9.toggleEmojisBox === 'function') {
+        Win.wrappedJSObject.vs_chatv9.toggleEmojisBox();
+        method = 'wrappedJSObject';
+      }
+    } catch (_) {}
+    // Path B: inject a tiny script into the PAGE world and ask it to call
+    // the function (works whenever the site's CSP allows inline scripts).
+    if (!method && (pageWorldCallOk || !cspBlockedInline)) {
+      const ok = await tryPageWorldCall(doc);
+      if (ok) { pageWorldCallOk = true; method = 'page-world-script'; }
+    }
+    // Path C: click the confirmed real toggle <img class="vs_chatv9_input_emojis">.
+    if (!method) {
+      const btn = findEmojiToggleButton(doc);
+      if (btn) { fullClickSequence(btn); method = 'toggle-img-click'; }
+    }
+    if (!method) return 'noop';
+    // Wait a moment for lazy render, then verify the picker actually opened.
+    const opened = await new Promise((resolve) => {
+      const start = Date.now();
+      const poll = () => {
+        if (pickerIsOpen()) { resolve(true); return; }
+        if (Date.now() - start > 1500) { resolve(false); return; }
+        setTimeout(poll, 100);
+      };
+      poll();
+    });
+    console.log(`[Vaughn Emotes] Toggle via ${method}: wasOpen=${wasOpen} -> nowOpen=${opened}`);
+    if (opened) return 'opened';
+    if (wasOpen) return 'closed';   // we accidentally closed it — retry once
+    return 'noop';
+  }
+
+  async function callSiteToggle(doc) {
+    const r = await ensurePickerOpened(doc);
+    return r !== 'noop';
+  }
+
+  // Find whichever document currently shows rendered emote items.
+  function docWithEmoteItems() {
+    for (const doc of allReachableDocs()) {
+      try {
+        if (parseEmotesFromDOM(doc).length > 0 || parseEmotesGenericFromDOM(doc).length > 0) {
+          return doc;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // Open the picker via the site's own API, harvest, then close it again.
+  // Returns true if a toggle path was available and used (regardless of
+  // whether new emotes appeared), false if nothing is reachable at all.
+  async function virtualLoadViaSiteApi() {
+    // Prefer the chat input's document, then our own, then any reachable frame.
+    const candidates = [];
+    if (chatInput && chatInput.ownerDocument) candidates.push(chatInput.ownerDocument);
+    candidates.push(document);
+    for (const d of allReachableDocs()) if (!candidates.includes(d)) candidates.push(d);
+
+    let result = 'noop';
+    let usedDoc = null;
+    for (const doc of candidates) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await ensurePickerOpened(doc);
+      if (r === 'opened') { result = 'opened'; usedDoc = doc; break; }
+      if (r !== 'noop' && result === 'noop') { result = r; usedDoc = doc; }
+    }
+    // If the first attempt CLOSED the picker (it was already open), try once
+    // more — the second call re-opens it.
+    if (result === 'closed') {
+      for (const doc of candidates) {
+        // eslint-disable-next-line no-await-in-loop
+        const r = await ensurePickerOpened(doc);
+        if (r === 'opened') { result = 'opened'; usedDoc = doc; break; }
+      }
+    }
+    if (result === 'noop') return false;
+
+    const openedNow = result === 'opened';
+
+    // Poll up to 4s for lazy-rendered items in ANY frame.
+    const list = await (() => {
+      return new Promise((resolve) => {
+        const start = Date.now();
+        const poll = () => {
+          for (const doc of allReachableDocs()) {
+            let l = [];
+            try { l = parseEmotesFromDOM(doc); } catch (_) {}
+            if (l.length === 0) { try { l = parseEmotesGenericFromDOM(doc); } catch (_) {} }
+            if (l.length > 0) { resolve(l); return; }
+          }
+          if (Date.now() - start > 4000) { resolve([]); return; }
+          setTimeout(poll, 150);
+        };
+        poll();
+      });
+    })();
+
+    if (list.length > 0) {
+      pickerEverOpened = true;
+      const before = emotes.size;
+      storeEmotes(list);
+      console.log(`[Vaughn Emotes] Picker rendered ${list.length} items; total now ${emotes.size} (+${emotes.size - before}).`);
+      maybeBuildDropdown();
+      if (!isTopFrame() && emotes.size >= MIN_FULL_LIST) postEmotesToParent(Array.from(emotes.values()));
+    } else {
+      console.warn('[Vaughn Emotes] Toggle used but no emote items rendered.');
+    }
+
+    // Close the picker again ONLY if we are the ones who opened it.
+    if (openedNow && usedDoc) {
+      try {
+        const btn = findEmojiToggleButton(usedDoc) || findEmojiButton();
+        if (btn && pickerIsOpen()) fullClickSequence(btn);
+      } catch (_) {}
+    }
+    return true;
+  }
+
   // THE MAIN LOADER: virtually open the emoji picker, harvest items, close it.
   async function virtualLoadEmotesByClickingPicker() {
-    if (emotes.size > 0) return;
+    if (emotes.size >= MIN_FULL_LIST) return;
     if (virtualClickAttempts >= VIRTUAL_CLICK_MAX_ATTEMPTS) {
-      console.warn('[Vaughn Emotes] Gave up after ' + virtualClickAttempts + ' virtual picker attempts.');
+      console.warn('[Vaughn Emotes] Gave up after ' + virtualClickAttempts + ' virtual picker attempts. Current total: ' + emotes.size + '.');
       return;
     }
     virtualClickAttempts += 1;
     lastVirtualClickAt = Date.now();
 
     tryInitInput();
+
+    // PREFERRED PATH: the site's own API, vs_chatv9.toggleEmojisBox().
+    // This reliably opens the *real* picker regardless of which element the
+    // heuristic button search would have (mis)targeted.
+    const apiUsed = await virtualLoadViaSiteApi();
+    if (apiUsed) {
+      if (emotes.size < MIN_FULL_LIST) {
+        scheduleVirtualEmoteLoad(3000);
+      } else {
+        console.log(`[Vaughn Emotes] Full emote list loaded: ${emotes.size} emotes.`);
+      }
+      return;
+    }
+    console.warn('[Vaughn Emotes] vs_chatv9.toggleEmojisBox() not reachable; falling back to synthetic click.');
 
     const btn = findEmojiButton();
     if (!btn) {
@@ -500,12 +852,15 @@
         });
       })();
       if (list.length > 0) {
+        pickerEverOpened = true;
+        const before = emotes.size;
         storeEmotes(list);
-        console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes via virtual picker click.`);
-        if (!isTopFrame()) postEmotesToParent(Array.from(emotes.values()));
+        console.log(`[Vaughn Emotes] Virtual click rendered ${list.length} items; total now ${emotes.size} (+${emotes.size - before}).`);
+        maybeBuildDropdown();
+        if (!isTopFrame() && emotes.size >= MIN_FULL_LIST) postEmotesToParent(Array.from(emotes.values()));
       } else {
         console.warn(
-          `[Vaughn Emotes] Virtual picker click (attempt ${virtualClickAttempts}/${VIRTUAL_CLICK_MAX_ATTEMPTS}) rendered no emote items.`
+          `[Vaughn Emotes] Virtual picker click (attempt ${virtualClickAttempts}/${VIRTUAL_CLICK_MAX_ATTEMPTS}) rendered no NEW emote items (total still ${emotes.size}).`
         );
         dumpEmojiDiagnostics();
         // Tell the parent frame we tried and found nothing, so a top-frame
@@ -526,7 +881,41 @@
       if (hadFocus && typeof hadFocus.focus === 'function') hadFocus.focus({ preventScroll: true });
     }
 
-    if (emotes.size === 0) scheduleVirtualEmoteLoad(3000);
+    // Keep going until we have what looks like the FULL list. If the count
+    // is stuck, the picker likely lazy-renders on scroll — try scrolling it
+    // open before the next click.
+    if (emotes.size < MIN_FULL_LIST) {
+      scheduleVirtualEmoteLoad(3000);
+    } else {
+      console.log(`[Vaughn Emotes] Full emote list loaded: ${emotes.size} emotes.`);
+    }
+  }
+
+  // Scroll every visible emoji-picker container to force lazy-render of all
+  // items (virtualized pickers only mount what's in view).
+  function scrollPickerContainers() {
+    for (const doc of allReachableDocs()) {
+      let nodes = [];
+      try { nodes = Array.from(doc.querySelectorAll('[class*="emoji"], [class*="emote"]')); } catch (_) {}
+      for (const el of nodes) {
+        try {
+          if (el.scrollHeight > el.clientHeight + 20) {
+            const step = Math.max(el.clientHeight, 200);
+            el.scrollTop = 0;
+            el.dispatchEvent(new (doc.defaultView || window).Event('scroll', { bubbles: true }));
+            let y = 0;
+            const tick = () => {
+              y += step;
+              el.scrollTop = y;
+              el.dispatchEvent(new (doc.defaultView || window).Event('scroll', { bubbles: true }));
+              if (y < el.scrollHeight) setTimeout(tick, 60);
+              else { el.scrollTop = 0; }
+            };
+            tick();
+          }
+        } catch (_) {}
+      }
+    }
   }
 
   // Candidate selectors, most specific first. Vaughn's CSS classes carry a
@@ -544,11 +933,53 @@
   // contain an <img> and have a title — whatever their class is. This is
   // how virtually every emoji picker is structured, so it survives site
   // CSS renames (vs_chatv9_* -> vs_chatv10_* etc.).
+  // Does this element (or an ancestor) look like the emoji PICKER container,
+  // as opposed to a chat message area? Used by every DOM heuristic so menu
+  // items are kept and message-list badges are dropped.
+  function isPickerish(el) {
+    let cur = el;
+    for (let i = 0; i < 8 && cur; i++) {
+      const hay = (((cur.className && String(cur.className)) || '') + ' ' + (cur.id || '')).toLowerCase();
+      if (/emoji|emote/.test(hay)) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
   function parseEmotesGenericFromDOM(doc) {
     doc = doc || document;
     const candidates = doc.querySelectorAll(
       '[title] img, [title] > img, button img, [role="button"] img, li img, span[class] img, div[class] img'
     );
+    // Precompute the chat container so we can tell "emote-ish imgs inside
+    // the chat" (streamer badges, sub emotes shown in messages) apart from
+    // actual picker items. Without this, a chat full of badge imgs yields a
+    // bogus 15-item "list" and masks the real ~1600-emote picker.
+    let chatScope = null;
+    try {
+      const inp = findChatInputInDoc(doc);
+      if (inp) {
+        // Climb until we reach an element that also contains other images
+        // (i.e. covers the message list, not just the footer/input).
+        chatScope = inp.closest('[class*="chat"], form') || inp.parentElement;
+        for (let i = 0; i < 8 && chatScope && chatScope.parentElement && chatScope.parentElement !== doc.body; i++) {
+          if (chatScope.querySelectorAll('img').length >= 5) break;
+          chatScope = chatScope.parentElement;
+        }
+      }
+    } catch (_) {}
+    // The whole-page container can never be a "message area" — pruning
+    // against body/html would disable the badge filter entirely (this was a
+    // bug: chat badge imgs got harvested as "emotes" on real pages where
+    // the closest [class*=chat] ancestor IS the body-level wrapper).
+    if (chatScope && (chatScope === doc.body || chatScope === doc.documentElement)) {
+      chatScope = null;
+    }
+    // Identify the toggle button up front: its subtree (the emoji menu,
+    // whether it renders inline next to the button or as a popup appended
+    // under it) is NEVER a message area — exclude it from chatScope pruning.
+    let toggleBtn = null;
+    try { toggleBtn = searchDocForEmojiButton(doc === document ? doc : (doc.body || doc)); } catch (_) {}
     const results = [];
     const seen = new Set();
     candidates.forEach((img) => {
@@ -561,6 +992,12 @@
       // real emote imgs are usually 20-80px and served from one dir.
       const src = img.getAttribute('src') || '';
       if (!src || /\.(svg|gif)($|\?)/i.test(src) && /logo|icon|flag/i.test(src)) return;
+      // Inside the chat area but NOT clickable -> it's a badge/emote shown
+      // in a message, not a picker item. Ignore it. (Exception: anything
+      // under the emoji toggle button is the menu itself, keep it.)
+      const clickable = !!(holder.getAttribute('onclick') || clickListenerTargets.has(holder));
+      const inToggleSubtree = toggleBtn && (toggleBtn === holder || toggleBtn.contains(holder));
+      if (!clickable && !inToggleSubtree && chatScope && chatScope.contains(holder)) return;
       const key = title.toLowerCase();
       if (seen.has(key)) return;
       seen.add(key);
@@ -585,14 +1022,21 @@
 
   function parseEmotesFromDOM(doc) {
     doc = doc || document;
+    let best = [];
     for (const sel of EMOTE_ITEM_SELECTORS) {
       const items = doc.querySelectorAll(sel);
       if (items.length === 0) continue;
       const parsed = extractEmotes(items);
-      if (parsed.length > 0) {
-        console.log(`[Vaughn Emotes] DOM parse: ${parsed.length} emotes via "${sel}"`);
-        return parsed;
-      }
+      // Don't return the FIRST selector that matches: broad selectors like
+      // '[class*="emote"]' also match the picker *container* divs, and a
+      // container's <img title> is often just the toggle icon — returning
+      // early harvested 15 chat badges instead of the real ~1600 items.
+      // Collect all candidates and keep the largest, most specific result.
+      if (parsed.length > best.length) best = parsed;
+    }
+    if (best.length > 0) {
+      console.log(`[Vaughn Emotes] DOM parse: ${best.length} emotes via class selectors`);
+      return best;
     }
     const generic = parseEmotesGenericFromDOM(doc);
     if (generic.length > 0) return generic;
@@ -631,6 +1075,78 @@
     return results;
   }
 
+  // The initial page HTML never contains the picker items (lazy render), so
+  // instead of fetching the page we look for the site's own emote-list JSON.
+  // Sites like this usually load the emoji list from a static endpoint
+  // (e.g. /emotes.json, /chat/emojis, cdn.../emoji*.json). We discover the
+  // URL by scanning every <script src>, performance entries and links for a
+  // plausible name, then fetch it same-origin and extract names+ids with a
+  // tolerant regex over the raw text (works whether it's JSON or JS).
+  const EMOTE_URL_RE = /(emote|emoji|smiley)[^/]*\.(json|js)(\?|$)/i;
+
+  function candidateEmoteUrls() {
+    const urls = new Set();
+    const add = (u) => { try { urls.add(new URL(u, location.href).href); } catch (_) {} };
+    try {
+      document.querySelectorAll('script[src]').forEach((s) => {
+        const src = s.src || '';
+        if (EMOTE_URL_RE.test(src)) add(src);
+      });
+      document.querySelectorAll('link[href]').forEach((l) => {
+        if (EMOTE_URL_RE.test(l.href)) add(l.href);
+      });
+    } catch (_) {}
+    try {
+      for (const e of performance.getEntriesByType('resource')) {
+        if (EMOTE_URL_RE.test(e.name)) add(e.name);
+      }
+    } catch (_) {}
+    // Common guesses as last resort.
+    ['/', '/chat', '/emotes', '/emoji'].forEach(() => {}); // no-op keep shape
+    return Array.from(urls);
+  }
+
+  // Extract {id,name} pairs from arbitrary JSON/JS text without assuming a
+  // schema: any object that has BOTH some id-ish field and some name/title
+  // -ish string field is treated as an emote.
+  function extractEmotesFromJsonText(text) {
+    const results = [];
+    const seen = new Set();
+    const objRe = /\{[^{}]*\}/g;   // flat objects only (emote lists are flat)
+    let m;
+    while ((m = objRe.exec(text)) !== null) {
+      const chunk = m[0];
+      const idM = chunk.match(/["']?(?:id|emoji_?id|emote_?id)["']?\s*[:=]\s*["']?([\w-]{3,64})["']?/i);
+      const nameM =
+        chunk.match(/["']?(?:name|title|label|shortcode|code)["']?\s*[:=]\s*["']([^"']{1,48})["']/i);
+      if (!nameM) continue;
+      const name = parseEmoteName(nameM[1]);
+      if (!name || seen.has(name.toLowerCase())) continue;
+      seen.add(name.toLowerCase());
+      results.push({ id: idM ? idM[1] : '', name, filename: '', width: 60, height: 60 });
+    }
+    return results;
+  }
+
+  async function fetchEmotesJSON() {
+    const urls = candidateEmoteUrls();
+    for (const url of urls) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const res = await fetch(url, { credentials: 'same-origin', cache: 'default' });
+        if (!res.ok) continue;
+        // eslint-disable-next-line no-await-in-loop
+        const text = await res.text();
+        const results = extractEmotesFromJsonText(text);
+        if (results.length >= 20) {
+          console.log(`[Vaughn Emotes] JSON source ${url}: ${results.length} emotes`);
+          return results;
+        }
+      } catch (_) {}
+    }
+    return [];
+  }
+
   async function fetchEmotesHTML() {
     try {
       const res = await fetch(window.location.origin + window.location.pathname, {
@@ -661,6 +1177,60 @@
     }
   }
 
+  // Re-parse the picker from the DOM WITHOUT logging (called on every user
+  // open via a MutationObserver). Picker items usually carry an onclick
+  // attribute or were recorded by our click-listener hook — require that so
+  // chat-message badge imgs are never mistaken for picker items.
+  function silentDomParse() {
+    let nodes = [];
+    try { nodes = Array.from(document.querySelectorAll('[title] img')); } catch (_) {}
+    const results = [];
+    const seen = new Set();
+    for (const img of nodes) {
+      const holder = img.closest('[title], [onclick]');
+      if (!holder) continue;
+      const title = parseEmoteName(holder.getAttribute('title') || '');
+      if (!title) continue;
+      const clickable = !!(holder.getAttribute('onclick') || clickListenerTargets.has(holder));
+      if (!clickable) continue;
+      const key = title.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const src = img.getAttribute('src') || '';
+      results.push({ id: '', name: title, filename: src.split('/').pop(), width: 0, height: 0 });
+    }
+    return results;
+  }
+
+  // Keep the local store in sync when the USER opens the emoji menu: any
+  // subtree mutation inside a container whose class mentions emoji/emote is
+  // treated as "picker rendered/changed" -> merge silently into the store.
+  let pickerObservers = new WeakSet();
+  function startLiveMerge(doc) {
+    if (!doc || !doc.body || pickerObservers.has(doc)) return;
+    try {
+      const obs = new doc.defaultView.MutationObserver((muts) => {
+        for (const m of muts) {
+          const el = m.target && m.target.nodeType === 1 ? m.target : (m.target && m.target.parentElement);
+          const hay = (((el && el.className) || '') + ' ' + ((el && el.id) || '')).toLowerCase();
+          if (/emoji|emote/.test(hay)) {
+            const list = silentDomParse();
+            if (list.length > 0) {
+              const before = emotes.size;
+              storeEmotes(list);
+              if (emotes.size !== before) {
+                console.log(`[Vaughn Emotes] Live merge: +${emotes.size - before} emotes (total ${emotes.size}).`);
+              }
+            }
+            break;
+          }
+        }
+      });
+      obs.observe(doc.body, { childList: true, subtree: true });
+      pickerObservers.add(doc);
+    } catch (_) {}
+  }
+
   let loadedFromHtml = false;
 
   async function loadEmotes() {
@@ -669,22 +1239,29 @@
     // maybe the user already opened it or the site pre-renders it.
     let list = parseEmotesFromDOM();
     if (list.length === 0 && !loadedFromHtml) {
-      // Fallback: some servers do include the picker markup in the HTML.
+      // Fallback 1: the site's own emote-list JSON/JS bundle (discovered via
+      // resource timing + script srcs). This is the ONLY way to get the full
+      // ~1600-emote list without opening the picker.
+      list = await fetchEmotesJSON();
+    }
+    if (list.length === 0 && !loadedFromHtml) {
+      // Fallback 2: some servers do include the picker markup in the HTML.
       list = await fetchEmotesHTML();
       if (list.length > 0) loadedFromHtml = true;
     }
     storeEmotes(list);
-    console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes`);
+    console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes${emotes.size > 0 && emotes.size < MIN_FULL_LIST ? ' (partial — continuing to load the full picker list…)' : ''}`);
+    if (emotes.size >= MIN_FULL_LIST) maybeBuildDropdown();
 
-    if (emotes.size === 0 && !isTopFrame()) {
-      // This frame may be the real chat (possibly cross-origin from the
-      // parent). Share whatever we have — even an empty list — so the
-      // top frame can stop guessing. We re-post after each virtual click.
-      postEmotesToParent([]);
+    if (!isTopFrame()) {
+      // Child frame: share whatever we have (even empty) with the parent.
+      postEmotesToParent(Array.from(emotes.values()));
     }
 
-    if (emotes.size === 0) {
-      // Nothing yet -> virtually open the emoji picker to force-render it.
+    if (emotes.size < MIN_FULL_LIST) {
+      // Nothing yet (or only a small pre-rendered subset, e.g. "recently
+      // used" badges) -> virtually open the emoji picker to force-render
+      // the full list and keep merging until it looks complete.
       scheduleVirtualEmoteLoad();
     }
   }
@@ -694,13 +1271,37 @@
   function getQuery() {
     if (!chatInput) return null;
     const pos = chatInput.selectionStart;
+    // selectionStart can be null on some input types (email/number) or in
+    // odd browser states — fall back to end-of-value instead of throwing.
+    if (pos === null || pos === undefined) return null;
     const textUpToCursor = chatInput.value.slice(0, pos);
-    for (const trigger of TRIGGER_CHARS) {
-      const idx = textUpToCursor.lastIndexOf(trigger);
-      if (idx === -1) continue;
+    // IMPORTANT: only the text BEFORE the cursor is ever considered. The
+    // chat box is a <textarea> whose Enter key inserts "\n" (submitChat
+    // handles sending), so `value` can contain multiline history — anything
+    // after the cursor must never influence the query.
+    // Single backward scan finds the NEAREST trigger char before the cursor.
+    // The old per-trigger loop aborted with `return null` as soon as the
+    // ':' scan crossed a '!' (and vice-versa), so e.g. "!po" could return
+    // null depending on TRIGGER_CHARS order — one of the reasons the
+    // dropdown never appeared while typing.
+    let idx = -1;
+    let trigger = null;
+    for (let i = pos - 1; i >= 0; i--) {
+      const ch = textUpToCursor[i];
+      if (/\s/.test(ch)) break;              // start of current word
+      if (TRIGGER_CHARS.includes(ch)) {
+        idx = i;                             // nearest trigger char before cursor
+        trigger = ch;
+        break;                               // everything between it and the
+      }                                      // cursor is the live query
+    }
+    if (idx !== -1 && trigger) {
       const query = textUpToCursor.slice(idx + 1);
-      // Query must have no whitespace after it (it's a live word being typed)
-      if (/^\S+$/.test(query) || query === '') {
+      // e.g. ":smile:" with cursor right after the closing colon -> the
+      // nearest trigger IS the closing colon and query is empty; show the
+      // full list only when there is at least one char to filter by, and
+      // hide otherwise (handled by caller via MIN_QUERY_LEN).
+      if (/^\S*$/.test(query)) {
         return { trigger, index: idx, query };
       }
     }
@@ -722,9 +1323,28 @@
 
   function positionDropdown() {
     if (!dropdown || !chatInput) return;
-    const rect = chatInput.getBoundingClientRect();
-    dropdown.style.left = `${rect.left}px`;
-    dropdown.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+    // The dropdown lives in OUR document, but chatInput may live in an
+    // iframe. Convert the input's viewport-relative rect to coordinates in
+    // our own viewport by adding the containing frame's offset chain.
+    let rect;
+    try { rect = chatInput.getBoundingClientRect(); } catch (_) { return; }
+    let left = rect.left;
+    let top = rect.top;
+    let win = window;
+    try {
+      const ownerWin = chatInput.ownerDocument && chatInput.ownerDocument.defaultView;
+      while (ownerWin && win !== ownerWin) {
+        const frameEl = win.frameElement;
+        if (!frameEl) break;
+        const fr = frameEl.getBoundingClientRect();
+        left += fr.left;
+        top += fr.top;
+        win = win.parent;
+      }
+    } catch (_) {}
+    const vh = window.innerHeight || 800;
+    dropdown.style.left = `${Math.max(0, left)}px`;
+    dropdown.style.bottom = `${Math.max(0, vh - top + 4)}px`;
     dropdown.style.width = `${Math.max(rect.width, 220)}px`;
   }
 
@@ -743,14 +1363,35 @@
   }
 
   function showAutocomplete() {
+    if (!chatInput) return;
+    // IMPORTANT: previously this bailed out when `dropdown` was null. In the
+    // real page the input is only discovered at load, but buildUI could be
+    // skipped by any earlier exception -> dropdown stayed null forever and
+    // the popup NEVER appeared. Create it on demand instead.
+    if (!dropdown || !(chatInput.ownerDocument || document).contains(dropdown)) buildUI();
+    if (!dropdown) return;
     const q = getQuery();
-    if (!q) return hideAutocomplete();
+    if (!q || !q.query) return hideAutocomplete();   // need at least ":x" — ":" alone shows nothing
     currentMatches = matchEmotes(q.query);
     if (currentMatches.length === 0) return hideAutocomplete();
     activeIndex = 0;
     renderDropdown(currentMatches);
     positionDropdown();
     dropdown.style.display = 'block';
+    // Self-check: if the site's own code wiped our popup (e.g. a global
+    // innerHTML rewrite), re-attach it once so we can tell the difference
+    // between "never shown" and "shown then removed".
+    setTimeout(() => {
+      try {
+        const ddoc = (chatInput && chatInput.ownerDocument) || document;
+        if (dropdown && !ddoc.contains(dropdown)) {
+          console.warn('[Vaughn Emotes] Dropdown was REMOVED from the DOM shortly after being shown — the site wipes our node.');
+          (ddoc.body || ddoc.documentElement).appendChild(dropdown);
+        } else if (dropdown && dropdown.parentElement && dropdown.style.display === 'block') {
+          console.log('[Vaughn Emotes] Dropdown is in the DOM and visible (items:', dropdown.children.length + ').');
+        }
+      } catch (_) {}
+    }, 50);
   }
 
   function hideAutocomplete() {
@@ -765,7 +1406,10 @@
     const q = getQuery();
     const pos = chatInput.selectionStart;
     const start = q ? q.index : pos;
-    const insert = `:${emote.name}: `;
+    // Preserve whichever trigger the user typed: ':foo' inserts ':name: ',
+    // '!foo' inserts 'name: ' (vaughn-style emote codes). The old code always
+    // inserted a leading colon, which corrupted '!' queries on replace.
+    const insert = (q && q.trigger === '!' ? '' : ':') + emote.name + ': ';
     chatInput.value =
       chatInput.value.slice(0, start) + insert + chatInput.value.slice(pos);
     const newPos = start + insert.length;
@@ -779,6 +1423,8 @@
   // ---------- events ----------
 
   function attachEvents(input) {
+    if (input.__vaughnEmoteBound) return; // never double-bind
+    input.__vaughnEmoteBound = true;
     input.addEventListener('input', showAutocomplete);
     input.addEventListener('keyup', (e) => {
       // Arrow navigation when dropdown open
@@ -812,21 +1458,65 @@
     });
     input.addEventListener('blur', () => setTimeout(hideAutocomplete, 150));
     input.addEventListener('click', showAutocomplete);
+    // The site's own handlers are inline attributes:
+    //   onkeyup="return vs_chatv9.submitChat(event, true)"
+    //   onkeydown="return vs_chatv9.submitChat(event, false)"
+    // Inline attribute handlers run BEFORE addEventListener listeners for the
+    // same event. If submitChat() returns false it cancels the default action,
+    // which means NO `input` event is ever fired while typing — our primary
+    // trigger would silently never run. So we also listen to raw keypress and
+    // poll the value on a microtask after each keystroke as a safety net.
+    input.addEventListener('keypress', () => setTimeout(showAutocomplete, 0));
+    let lastValue = null;
+    setInterval(() => {
+      try {
+        const v = chatInput ? chatInput.value : null;
+        if (v !== lastValue) { lastValue = v; showAutocomplete(); }
+      } catch (_) {}
+    }, 200);
   }
 
   function buildUI() {
-    dropdown = document.createElement('div');
+    // The dropdown MUST be appended to the same document that contains the
+    // chat input. When the script runs at document_idle and the chat lives
+    // inside an iframe, `document` here is the TOP page while `chatInput`
+    // belongs to the iframe's document. Appending the popup to the wrong
+    // document makes it permanently invisible no matter what we set on it —
+    // exactly the "autocomplete never appears" symptom.
+    const targetDoc = (chatInput && chatInput.ownerDocument) || document;
+    if (dropdown && targetDoc.contains(dropdown)) return; // one per document
+    dropdown = null; // drop stale node from a replaced/wrong document
+    ensureStyleInThisDocument(targetDoc);
+    dropdown = targetDoc.createElement('div');
     dropdown.id = 'vaughn-emote-dropdown';
     dropdown.style.display = 'none';
-    document.documentElement.appendChild(dropdown);
+    (targetDoc.body || targetDoc.documentElement).appendChild(dropdown);
+  }
+
+  // The dropdown is only useful in the frame that actually contains the chat
+  // input. Frames without an input skip UI entirely (they still harvest and
+  // post emotes to the parent).
+  function maybeBuildDropdown() {
+    if (!chatInput && !tryInitInput()) return;
+    if (chatInput) buildUI();
   }
 
   function tryInitInput() {
-    if (chatInput) return true;
-    chatInput = findChatInput();
-    if (chatInput) {
+    // If the element we previously bound is gone (site re-rendered the chat),
+    // drop it so we can discover and bind the new one.
+    if (chatInput && !document.contains(chatInput) &&
+        !(chatInput.ownerDocument && chatInput.ownerDocument.defaultView)) {
+      chatInput = null;
+    }
+    if (chatInput && document.contains(chatInput)) return true;
+    const el = findChatInput();
+    if (el) {
+      chatInput = el;
+      buildUI();
       attachEvents(chatInput);
-      console.log('[Vaughn Emotes] Chat input found, autocomplete ready.');
+      console.log('[Vaughn Emotes] Chat input found:',
+        `${chatInput.tagName.toLowerCase()}#${chatInput.id || '(no id)'}`,
+        '- autocomplete ready.');
       return true;
     }
     return false;
@@ -840,7 +1530,9 @@
     // The old top-frame-only guard made the script exit immediately in the
     // chat iframe — that's why you saw "Loaded 0 emotes" / nothing happened.
 
-    buildUI();
+    // Build the dropdown ONLY if this frame has the chat input (or when the
+    // input appears later — tryInitInput calls buildUI). Frames without an
+    // input stay UI-less so we never get invisible/duplicate dropdowns.
     tryInitInput();
     await loadEmotes();
 
@@ -875,21 +1567,33 @@
         chatInput = null;
         tryInitInput();
       }
-      // If emotes haven't loaded yet (picker not rendered on first pass),
-      // retry parsing from DOM whenever the page mutates — this catches
-      // the case where the USER opens the emoji picker themselves, and
-      // also when our virtual click renders it. Throttled to avoid
-      // re-parsing on every single mutation.
-      if (emotes.size === 0 && Date.now() - domParseThrottle > 500) {
+      // The picker may render/change whenever the USER opens the emoji menu.
+      // Merge silently (throttled) so the store converges on the full list
+      // even if our virtual click never found the right toggle button.
+      if (emotes.size < MIN_FULL_LIST && Date.now() - domParseThrottle > 500) {
         domParseThrottle = Date.now();
-        const domList = parseEmotesFromDOM();
-        if (domList.length) {
+        const domList = silentDomParse();
+        if (domList.length >= 10) {
+          const before = emotes.size;
           storeEmotes(domList);
-          console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes (picker detected in DOM).`);
+          if (emotes.size !== before) {
+            console.log(`[Vaughn Emotes] Merged ${emotes.size} emotes from DOM (picker detected; +${emotes.size - before}).`);
+            maybeBuildDropdown();
+            if (!isTopFrame()) postEmotesToParent(Array.from(emotes.values()));
+          }
         }
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
+
+    // Live-merge directly inside chat iframe documents too (their own
+    // MutationObservers see their own lazy renders immediately).
+    startLiveMerge(document);
+    try {
+      document.querySelectorAll('iframe').forEach((f) => {
+        try { if (f.contentDocument) startLiveMerge(f.contentDocument); } catch (_) {}
+      });
+    } catch (_) {}
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') hideAutocomplete();
