@@ -8,3 +8,4 @@ debug_*.js
 # Build artifacts
 *.xpi
 *.zip
+vaughn-emote-autocomplete-*.xpi
