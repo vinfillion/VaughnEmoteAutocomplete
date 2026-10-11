@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const TRIGGER_CHARS = [':', '!'];       // characters that start a query
+  const TRIGGER_CHARS = [':'];            // only ':' starts a query ('!' removed)
   const MAX_SUGGESTIONS = 12;
   const MIN_QUERY_LEN = 1;                // show suggestions after 1 char
 
@@ -123,7 +123,7 @@
       window.parent.postMessage({
         __vaughnEmoteMsg: MSG_TAG,
         frameUrl: location.href,
-        emotes: list.map((e) => ({ id: e.id, name: e.name, filename: e.filename, width: e.width, height: e.height })),
+        emotes: list.map((e) => ({ id: e.id, name: e.name, query: queryKey(e.name), filename: e.filename, width: e.width, height: e.height })),
       }, '*');
     } catch (_) {}
   }
@@ -146,8 +146,19 @@
     }, delayMs || 2500);
   }
 
-  // Parse emote name - remove surrounding parentheses/brackets
-  const parseEmoteName = (name) => (name || '').replace(/^[\(\)\[\]:]+|[\(\)\[\]:]+$/g, '').trim();
+  // Parse emote name - remove surrounding brackets/colon (but KEEP the
+  // parentheses: real vaughn.live emote titles are literally "(nowayy)",
+  // and the user wants the full "(nowayy)" inserted into the chat box).
+  // We store both forms:
+  //   e.name  -> display/insert form, parentheses preserved ("(nowayy)")
+  //   e.query -> normalized match key, parens stripped ("nowayy") so typing
+  //              ":now" matches whether the site shows "(nowayy)" or "nowayy".
+  const parseEmoteName = (name) => (name || '').replace(/^[[\]:]+|[[\]:]+$/g, '').trim();
+  const queryKey = (name) => (name || '').replace(/[()]/g, '').toLowerCase();
+
+  function makeEmote(id, name, filename, width, height) {
+    return { id, name, query: queryKey(name), filename, width, height };
+  }
 
   function isUsable(el) {
     return !!(el && (el.tagName === 'TEXTAREA' || el.isContentEditable ||
@@ -216,13 +227,13 @@
       const img = item.querySelector('img');
       const src = img ? img.getAttribute('src') : '';
 
-      return {
-        id: idMatch ? idMatch[1] : '',
-        name: parseEmoteName(title),
-        filename: src ? src.split('/').pop() : '',
-        width: img ? parseInt(img.getAttribute('width'), 10) || 0 : 0,
-        height: img ? parseInt(img.getAttribute('height'), 10) || 0 : 0,
-      };
+      return makeEmote(
+        idMatch ? idMatch[1] : '',
+        parseEmoteName(title),
+        src ? src.split('/').pop() : '',
+        img ? parseInt(img.getAttribute('width'), 10) || 0 : 0,
+        img ? parseInt(img.getAttribute('height'), 10) || 0 : 0
+      );
     }).filter((e) => e.name);
   }
 
@@ -474,7 +485,7 @@
               const name = parseEmoteName(v);
               if (name && !seen.has(name.toLowerCase())) {
                 seen.add(name.toLowerCase());
-                results.push({ id: '', name, filename: '', width: 60, height: 60 });
+                results.push(makeEmote('', name, '', 60, 60));
               }
             }
           }
@@ -487,7 +498,7 @@
                   const name = parseEmoteName(nm);
                   if (name && !seen.has(name.toLowerCase())) {
                     seen.add(name.toLowerCase());
-                    results.push({ id: String(obj.id || ''), name, filename: '', width: 60, height: 60 });
+                    results.push(makeEmote(String(obj.id || ''), name, '', 60, 60));
                   }
                 }
               }
@@ -1003,13 +1014,13 @@
       seen.add(key);
       const onclick = holder.getAttribute('onclick') || String(holder.onclick || '');
       const idMatch = onclick.match(/insertEmoji\(\s*['"]([^'"]+)['"]\s*,/);
-      results.push({
-        id: idMatch ? idMatch[1] : '',
-        name: title,
-        filename: src.split('/').pop(),
-        width: parseInt(img.getAttribute('width'), 10) || img.naturalWidth || 0,
-        height: parseInt(img.getAttribute('height'), 10) || img.naturalHeight || 0,
-      });
+      results.push(makeEmote(
+        idMatch ? idMatch[1] : '',
+        title,
+        src.split('/').pop(),
+        parseInt(img.getAttribute('width'), 10) || img.naturalWidth || 0,
+        parseInt(img.getAttribute('height'), 10) || img.naturalHeight || 0
+      ));
     });
     // Require a plausible count before trusting this heuristic (a chat page
     // has a handful of titled imgs outside the picker too).
@@ -1070,7 +1081,7 @@
       const name = parseEmoteName(titleMatch[1]);
       if (!name || seen.has(name.toLowerCase())) continue;
       seen.add(name.toLowerCase());
-      results.push({ id, name, filename: '', width: 60, height: 60 });
+      results.push(makeEmote(id, name, '', 60, 60));
     }
     return results;
   }
@@ -1123,7 +1134,7 @@
       const name = parseEmoteName(nameM[1]);
       if (!name || seen.has(name.toLowerCase())) continue;
       seen.add(name.toLowerCase());
-      results.push({ id: idM ? idM[1] : '', name, filename: '', width: 60, height: 60 });
+      results.push(makeEmote(idM ? idM[1] : '', name, '', 60, 60));
     }
     return results;
   }
@@ -1173,7 +1184,11 @@
 
   function storeEmotes(list) {
     for (const e of list) {
-      emotes.set(e.name.toLowerCase(), e);
+      if (!e || !e.name) continue;
+      // Ensure the normalized match key exists even for emotes that arrive
+      // via postMessage from a child frame or an older parse path.
+      if (!e.query) e.query = queryKey(e.name);
+      emotes.set(e.query, e);
     }
   }
 
@@ -1197,7 +1212,7 @@
       if (seen.has(key)) continue;
       seen.add(key);
       const src = img.getAttribute('src') || '';
-      results.push({ id: '', name: title, filename: src.split('/').pop(), width: 0, height: 0 });
+      results.push(makeEmote('', title, src.split('/').pop(), 0, 0));
     }
     return results;
   }
@@ -1308,13 +1323,27 @@
     return null;
   }
 
+  // The word BEFORE the cursor, ignoring the ':' trigger. Used for Tab
+  // inline-completion so "nowa" + Tab completes to "(nowayy)" even without
+  // typing a colon first (requirement #4).
+  function getWordBeforeCursor() {
+    if (!chatInput) return null;
+    const pos = chatInput.selectionStart;
+    if (pos === null || pos === undefined) return null;
+    let i = pos - 1;
+    while (i >= 0 && /\S/.test(chatInput.value[i])) i--;
+    return { index: i + 1, text: chatInput.value.slice(i + 1, pos) };
+  }
+
   function matchEmotes(query) {
     if (!query || query.length < MIN_QUERY_LEN) return [];
     const q = query.toLowerCase();
     const starts = [];
     const contains = [];
     for (const e of emotes.values()) {
-      const name = e.name.toLowerCase();
+      // Match against the normalized key (parentheses stripped): typing
+      // ":now" must find "(nowayy)" whose raw name starts with '('.
+      const name = e.query || queryKey(e.name);
       if (name.startsWith(q)) starts.push(e);
       else if (name.includes(q)) contains.push(e);
     }
@@ -1349,11 +1378,12 @@
   }
 
   function renderDropdown(matches) {
+    const ddoc = (chatInput && chatInput.ownerDocument) || document;
     dropdown.innerHTML = '';
     matches.forEach((emote, i) => {
-      const item = document.createElement('div');
+      const item = ddoc.createElement('div');
       item.className = 'vaughn-emote-item' + (i === activeIndex ? ' vaughn-emote-active' : '');
-      item.textContent = emote.name;
+      item.textContent = emote.name;   // shows "(nowayy)" with parens, as on the site
       item.addEventListener('mousedown', (ev) => {
         ev.preventDefault(); // keep focus in the chat input
         selectEmote(emote);
@@ -1371,7 +1401,22 @@
     if (!dropdown || !(chatInput.ownerDocument || document).contains(dropdown)) buildUI();
     if (!dropdown) return;
     const q = getQuery();
-    if (!q || !q.query) return hideAutocomplete();   // need at least ":x" — ":" alone shows nothing
+    if (!q || !q.query) {
+      // ':' alone (or no trigger): show the full list so Tab/Enter still have
+      // suggestions, but only right after the trigger was typed — otherwise
+      // keep it hidden to avoid a popup covering the chat while editing.
+      if (q && !q.query && lastKeyWasColon) {
+        currentMatches = Array.from(emotes.values()).slice(0, MAX_SUGGESTIONS);
+        if (currentMatches.length) {
+          activeIndex = 0;
+          renderDropdown(currentMatches);
+          positionDropdown();
+          dropdown.style.display = 'block';
+          return;
+        }
+      }
+      return hideAutocomplete();   // need at least ":x" — ":" alone shows nothing
+    }
     currentMatches = matchEmotes(q.query);
     if (currentMatches.length === 0) return hideAutocomplete();
     activeIndex = 0;
@@ -1400,16 +1445,19 @@
     currentMatches = [];
   }
 
-  // Insert the chosen emote, replacing the ":partial" text at the cursor.
-  function selectEmote(emote) {
+  // Insert the chosen emote, replacing the ":partial" (or bare word for Tab)
+  // text at the cursor. Vaughn emote codes are literally "(name)" — the
+  // titles already include the parentheses, so we insert them verbatim and
+  // do NOT wrap in colons.
+  function selectEmote(emote, replaceFrom) {
     if (!chatInput) return;
-    const q = getQuery();
     const pos = chatInput.selectionStart;
-    const start = q ? q.index : pos;
-    // Preserve whichever trigger the user typed: ':foo' inserts ':name: ',
-    // '!foo' inserts 'name: ' (vaughn-style emote codes). The old code always
-    // inserted a leading colon, which corrupted '!' queries on replace.
-    const insert = (q && q.trigger === '!' ? '' : ':') + emote.name + ': ';
+    // replaceFrom overrides the ':' trigger index (used by Tab completion on
+    // a bare word); otherwise start at the ':' that began the query.
+    const start = (replaceFrom !== undefined && replaceFrom !== null)
+      ? replaceFrom
+      : (getQuery() ? getQuery().index : pos);
+    const insert = emote.name + ' ';   // e.g. "(nowayy) "
     chatInput.value =
       chatInput.value.slice(0, start) + insert + chatInput.value.slice(pos);
     const newPos = start + insert.length;
@@ -1420,7 +1468,35 @@
     hideAutocomplete();
   }
 
+  // Tab inline-completion: complete the bare word before the cursor to the
+  // first matching emote ("nowa" + Tab -> "(nowayy) ").
+  function tryTabComplete() {
+    const w = getWordBeforeCursor();
+    if (!w || !w.text) return false;
+    const matches = matchEmotes(w.text);
+    if (matches.length === 0) return false;
+    selectEmote(matches[0], w.index);
+    return true;
+  }
+
   // ---------- events ----------
+
+  // The site's chat box uses INLINE attribute handlers:
+  //   onkeydown="return vs_chatv9.submitChat(event, false)"
+  //   onkeyup ="return vs_chatv9.submitChat(event, true)"
+  // Two consequences that broke Enter-autocomplete:
+  //   1. Inline handlers run BEFORE addEventListener listeners for the same
+  //      event, so our keydown listener fires AFTER submitChat() has already
+  //      sent the message.
+  //   2. If submitChat() returns false it cancels the default action (no \n
+  //      inserted), but the SEND already happened.
+  // Fix: capture-phase keydown on window. Capture runs before BOTH inline
+  // handlers and bubble listeners, so we can swallow the Enter/Tab keystroke
+  // entirely (preventDefault + stopImmediatePropagation) before the site ever
+  // sees it — no send, only autocomplete.
+  function isOpen() {
+    return !!(dropdown && dropdown.style.display === 'block' && currentMatches.length > 0);
+  }
 
   function attachEvents(input) {
     if (input.__vaughnEmoteBound) return; // never double-bind
@@ -1428,7 +1504,7 @@
     input.addEventListener('input', showAutocomplete);
     input.addEventListener('keyup', (e) => {
       // Arrow navigation when dropdown open
-      if (dropdown && dropdown.style.display === 'block') {
+      if (isOpen()) {
         if (e.key === 'ArrowDown') {
           activeIndex = (activeIndex + 1) % currentMatches.length;
           renderDropdown(currentMatches);
@@ -1442,30 +1518,56 @@
         showAutocomplete();
       }
     });
-    input.addEventListener('keydown', (e) => {
-      if (dropdown && dropdown.style.display === 'block') {
-        if (e.key === 'Enter' && activeIndex >= 0) {
-          e.preventDefault();
-          e.stopPropagation();
-          selectEmote(currentMatches[activeIndex]);
-        } else if (e.key === 'Escape') {
-          hideAutocomplete();
-        } else if (e.key === 'Tab' && activeIndex >= 0) {
-          e.preventDefault();
-          selectEmote(currentMatches[activeIndex]);
+    // Window-level CAPTURE handler: intercepts Enter/Tab before the site's
+    // inline onkeydown/onkeyup submitChat() handlers run at all.
+    const ownerWin = input.ownerDocument && input.ownerDocument.defaultView;
+    if (ownerWin && ownerWin !== ownerWin.top) {
+      // still bind to the iframe's own window so capture order is correct
+    }
+    (ownerWin || window).addEventListener('keydown', (e) => {
+      if (e.target !== input) return;         // only our chat box
+      if (!isOpen()) {
+        // Tab inline-completion works even with NO dropdown open: completing
+        // the bare word before the cursor ("nowa" + Tab -> "(nowayy) ").
+        // IMPORTANT: preventDefault() must run for EVERY plain Tab press in
+        // the chat box, not just successful completions — otherwise the
+        // browser's default Tab moves focus to the next element and the
+        // textarea loses focus when there is no emote match.
+        if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+          const matched = tryTabComplete();
+          e.preventDefault();                 // always keep focus in the box
+          e.stopImmediatePropagation();
+          if (!matched) {
+            // No completion found: re-assert focus so it can never slip away
+            // (belt-and-suspenders in case another handler still runs).
+            setTimeout(() => { try { input.focus({ preventScroll: true }); } catch (_) {} }, 0);
+          }
         }
+        return;
       }
-    });
+      if (e.key === 'Enter') {
+        // Autocomplete ONLY — never let this Enter reach submitChat().
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        selectEmote(currentMatches[Math.max(0, activeIndex)]);
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        selectEmote(currentMatches[Math.max(0, activeIndex)]);
+      } else if (e.key === 'Escape') {
+        hideAutocomplete();
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        // handled in keyup; keep default suppressed here so the caret does
+        // not jump to the textarea start/end while navigating suggestions
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    }, true); // <-- capture phase, beats inline attribute handlers
     input.addEventListener('blur', () => setTimeout(hideAutocomplete, 150));
     input.addEventListener('click', showAutocomplete);
-    // The site's own handlers are inline attributes:
-    //   onkeyup="return vs_chatv9.submitChat(event, true)"
-    //   onkeydown="return vs_chatv9.submitChat(event, false)"
-    // Inline attribute handlers run BEFORE addEventListener listeners for the
-    // same event. If submitChat() returns false it cancels the default action,
-    // which means NO `input` event is ever fired while typing — our primary
-    // trigger would silently never run. So we also listen to raw keypress and
-    // poll the value on a microtask after each keystroke as a safety net.
+    // Safety net: if submitChat() suppresses `input` events while typing,
+    // raw keypress + a short poll still refresh the dropdown.
     input.addEventListener('keypress', () => setTimeout(showAutocomplete, 0));
     let lastValue = null;
     setInterval(() => {
