@@ -2,9 +2,21 @@
   "manifest_version": 2,
   "name": "Vaughn Emote Autocomplete",
   "version": "1.0.0",
-  "description": "Autocomplete emotes in vaughn.live chat by typing :name.",
+  "description": "Autocompletes vaughn.live chat emotes while you type: press ':' to get suggestions, Enter or Tab to insert the selected emote.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "vaughn-emote-autocomplete@vinfillion.github.io",
+      "strict_min_version": "109.0"
+    }
+  },
   "author": "vinfillion",
   "homepage_url": "https://github.com/vinfillion/VaughnEmoteAutocomplete",
+  "icons": {
+    "16": "assets/icon-16.png",
+    "32": "assets/icon-32.png",
+    "48": "assets/icon-48.png",
+    "96": "assets/icon-96.png"
+  },
   "content_scripts": [
     {
       "matches": ["https://vaughn.live/*"],

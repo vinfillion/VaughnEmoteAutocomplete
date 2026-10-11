@@ -15,6 +15,18 @@
 (() => {
   'use strict';
 
+  // ---------- debug logging ----------
+  // AMO reviewers and normal users should not see console spam. All
+  // [Vaughn Emotes] logs are gated behind DEBUG, which defaults to false.
+  // Enable it at runtime from the browser console (per frame):
+  //   localStorage.setItem('vaughn-emote-debug', '1')  then reload.
+  const DEBUG = (() => {
+    try { return localStorage.getItem('vaughn-emote-debug') === '1'; }
+    catch (_) { return false; }
+  })();
+  const dlog = (...a) => { if (DEBUG) console.log(...a); };
+  const dwarn = (...a) => { if (DEBUG) console.warn(...a); };
+
   const TRIGGER_CHARS = [':'];            // only ':' starts a query ('!' removed)
   const MAX_SUGGESTIONS = 12;
   const MIN_QUERY_LEN = 1;                // show suggestions after 1 char
@@ -111,7 +123,7 @@
     if (d.emotes.length > 0) {
       const before = emotes.size;
       storeEmotes(d.emotes);
-      console.log(`[Vaughn Emotes] Received ${d.emotes.length} emotes from child frame (${d.frameUrl || 'cross-origin'}); total now ${emotes.size} (+${emotes.size - before}).`);
+      dlog(`[Vaughn Emotes] Received ${d.emotes.length} emotes from child frame (${d.frameUrl || 'cross-origin'}); total now ${emotes.size} (+${emotes.size - before}).`);
       if (emotes.size >= MIN_FULL_LIST) maybeBuildDropdown();
     } else {
       pendingChildEmotes.push(d);                      // frame opened but rendered nothing yet
@@ -338,10 +350,10 @@
           if (info.imgSrcSamples.length < 20) info.imgSrcSamples.push(s.slice(0, 140));
         }
       });
-      console.log('[Vaughn Emotes] DIAGNOSTICS:', JSON.stringify(info, null, 2));
+      dlog('[Vaughn Emotes] DIAGNOSTICS:', JSON.stringify(info, null, 2));
       return info;
     } catch (err) {
-      console.warn('[Vaughn Emotes] diagnostics failed:', err);
+      dwarn('[Vaughn Emotes] diagnostics failed:', err);
     }
   }
   try { window.__vaughnEmoteDiag = dumpEmojiDiagnostics; } catch (_) {}
@@ -734,7 +746,7 @@
       };
       poll();
     });
-    console.log(`[Vaughn Emotes] Toggle via ${method}: wasOpen=${wasOpen} -> nowOpen=${opened}`);
+    dlog(`[Vaughn Emotes] Toggle via ${method}: wasOpen=${wasOpen} -> nowOpen=${opened}`);
     if (opened) return 'opened';
     if (wasOpen) return 'closed';   // we accidentally closed it — retry once
     return 'noop';
@@ -810,11 +822,11 @@
       pickerEverOpened = true;
       const before = emotes.size;
       storeEmotes(list);
-      console.log(`[Vaughn Emotes] Picker rendered ${list.length} items; total now ${emotes.size} (+${emotes.size - before}).`);
+      dlog(`[Vaughn Emotes] Picker rendered ${list.length} items; total now ${emotes.size} (+${emotes.size - before}).`);
       maybeBuildDropdown();
       if (!isTopFrame() && emotes.size >= MIN_FULL_LIST) postEmotesToParent(Array.from(emotes.values()));
     } else {
-      console.warn('[Vaughn Emotes] Toggle used but no emote items rendered.');
+      dwarn('[Vaughn Emotes] Toggle used but no emote items rendered.');
     }
 
     // Close the picker again ONLY if we are the ones who opened it.
@@ -831,7 +843,7 @@
   async function virtualLoadEmotesByClickingPicker() {
     if (emotes.size >= MIN_FULL_LIST) return;
     if (virtualClickAttempts >= VIRTUAL_CLICK_MAX_ATTEMPTS) {
-      console.warn('[Vaughn Emotes] Gave up after ' + virtualClickAttempts + ' virtual picker attempts. Current total: ' + emotes.size + '.');
+      dwarn('[Vaughn Emotes] Gave up after ' + virtualClickAttempts + ' virtual picker attempts. Current total: ' + emotes.size + '.');
       return;
     }
     virtualClickAttempts += 1;
@@ -847,19 +859,19 @@
       if (emotes.size < MIN_FULL_LIST) {
         scheduleVirtualEmoteLoad(3000);
       } else {
-        console.log(`[Vaughn Emotes] Full emote list loaded: ${emotes.size} emotes.`);
+        dlog(`[Vaughn Emotes] Full emote list loaded: ${emotes.size} emotes.`);
       }
       return;
     }
-    console.warn('[Vaughn Emotes] vs_chatv9.toggleEmojisBox() not reachable; falling back to synthetic click.');
+    dwarn('[Vaughn Emotes] vs_chatv9.toggleEmojisBox() not reachable; falling back to synthetic click.');
 
     const btn = findEmojiButton();
     if (!btn) {
-      console.warn(`[Vaughn Emotes] Virtual load attempt ${virtualClickAttempts}: emoji picker button not found yet.`);
+      dwarn(`[Vaughn Emotes] Virtual load attempt ${virtualClickAttempts}: emoji picker button not found yet.`);
       scheduleVirtualEmoteLoad(3000);
       return;
     }
-    console.log('[Vaughn Emotes] Virtual click target:', btn.tagName, btn.className || '(no class)',
+    dlog('[Vaughn Emotes] Virtual click target:', btn.tagName, btn.className || '(no class)',
                 '| listener:', hasClickListener(btn) ? 'yes' : 'NO');
 
     const hadFocus = document.activeElement;
@@ -913,11 +925,11 @@
         pickerEverOpened = true;
         const before = emotes.size;
         storeEmotes(list);
-        console.log(`[Vaughn Emotes] Virtual click rendered ${list.length} items; total now ${emotes.size} (+${emotes.size - before}).`);
+        dlog(`[Vaughn Emotes] Virtual click rendered ${list.length} items; total now ${emotes.size} (+${emotes.size - before}).`);
         maybeBuildDropdown();
         if (!isTopFrame() && emotes.size >= MIN_FULL_LIST) postEmotesToParent(Array.from(emotes.values()));
       } else {
-        console.warn(
+        dwarn(
           `[Vaughn Emotes] Virtual picker click (attempt ${virtualClickAttempts}/${VIRTUAL_CLICK_MAX_ATTEMPTS}) rendered no NEW emote items (total still ${emotes.size}).`
         );
         dumpEmojiDiagnostics();
@@ -945,7 +957,7 @@
     if (emotes.size < MIN_FULL_LIST) {
       scheduleVirtualEmoteLoad(3000);
     } else {
-      console.log(`[Vaughn Emotes] Full emote list loaded: ${emotes.size} emotes.`);
+      dlog(`[Vaughn Emotes] Full emote list loaded: ${emotes.size} emotes.`);
     }
   }
 
@@ -1076,7 +1088,7 @@
     // Require a plausible count before trusting this heuristic (a chat page
     // has a handful of titled imgs outside the picker too).
     if (results.length >= 5) {
-      console.log(`[Vaughn Emotes] Generic DOM parse: ${results.length} emotes (no class match needed)`);
+      dlog(`[Vaughn Emotes] Generic DOM parse: ${results.length} emotes (no class match needed)`);
       return results;
     }
     return [];
@@ -1097,7 +1109,7 @@
       if (parsed.length > best.length) best = parsed;
     }
     if (best.length > 0) {
-      console.log(`[Vaughn Emotes] DOM parse: ${best.length} emotes via class selectors`);
+      dlog(`[Vaughn Emotes] DOM parse: ${best.length} emotes via class selectors`);
       return best;
     }
     const generic = parseEmotesGenericFromDOM(doc);
@@ -1105,7 +1117,7 @@
     // Final resort: React fiber props (survives any CSS rename / missing titles).
     const fiber = harvestFromReactFiber();
     if (fiber.length >= 5) {
-      console.log(`[Vaughn Emotes] React fiber harvest: ${fiber.length} emotes`);
+      dlog(`[Vaughn Emotes] React fiber harvest: ${fiber.length} emotes`);
       return fiber;
     }
     return [];
@@ -1201,7 +1213,7 @@
         const text = await res.text();
         const results = extractEmotesFromJsonText(text);
         if (results.length >= 20) {
-          console.log(`[Vaughn Emotes] JSON source ${url}: ${results.length} emotes`);
+          dlog(`[Vaughn Emotes] JSON source ${url}: ${results.length} emotes`);
           return results;
         }
       } catch (_) {}
@@ -1219,16 +1231,16 @@
       const html = await res.text();
       const results = parseEmotesFromHtmlString(html);
       if (results.length === 0) {
-        console.warn(
+        dwarn(
           '[Vaughn Emotes] fetch fallback found no insertEmoji() calls in HTML.',
           'If you see this in the WEB CONSOLE (not the add-on console), Cloudflare blocked the request.'
         );
       } else {
-        console.log(`[Vaughn Emotes] HTML fallback: ${results.length} emotes`);
+        dlog(`[Vaughn Emotes] HTML fallback: ${results.length} emotes`);
       }
       return results;
     } catch (err) {
-      console.warn('[Vaughn Emotes] fetch fallback failed:', err);
+      dwarn('[Vaughn Emotes] fetch fallback failed:', err);
       return [];
     }
   }
@@ -1288,7 +1300,7 @@
               const before = emotes.size;
               storeEmotes(list);
               if (emotes.size !== before) {
-                console.log(`[Vaughn Emotes] Live merge: +${emotes.size - before} emotes (total ${emotes.size}).`);
+                dlog(`[Vaughn Emotes] Live merge: +${emotes.size - before} emotes (total ${emotes.size}).`);
               }
             }
             break;
@@ -1319,7 +1331,7 @@
       if (list.length > 0) loadedFromHtml = true;
     }
     storeEmotes(list);
-    console.log(`[Vaughn Emotes] Loaded ${emotes.size} emotes${emotes.size > 0 && emotes.size < MIN_FULL_LIST ? ' (partial — continuing to load the full picker list…)' : ''}`);
+    dlog(`[Vaughn Emotes] Loaded ${emotes.size} emotes${emotes.size > 0 && emotes.size < MIN_FULL_LIST ? ' (partial — continuing to load the full picker list…)' : ''}`);
     if (emotes.size >= MIN_FULL_LIST) maybeBuildDropdown();
 
     if (!isTopFrame()) {
@@ -1474,10 +1486,10 @@
       try {
         const ddoc = (chatInput && chatInput.ownerDocument) || document;
         if (dropdown && !ddoc.contains(dropdown)) {
-          console.warn('[Vaughn Emotes] Dropdown was REMOVED from the DOM shortly after being shown — the site wipes our node.');
+          dwarn('[Vaughn Emotes] Dropdown was REMOVED from the DOM shortly after being shown — the site wipes our node.');
           (ddoc.body || ddoc.documentElement).appendChild(dropdown);
         } else if (dropdown && dropdown.parentElement && dropdown.style.display === 'block') {
-          console.log('[Vaughn Emotes] Dropdown is in the DOM and visible (items:', dropdown.children.length + ').');
+          dlog('[Vaughn Emotes] Dropdown is in the DOM and visible (items:', dropdown.children.length + ').');
         }
       } catch (_) {}
     }, 50);
@@ -1660,7 +1672,7 @@
       chatInput = el;
       buildUI();
       attachEvents(chatInput);
-      console.log('[Vaughn Emotes] Chat input found:',
+      dlog('[Vaughn Emotes] Chat input found:',
         `${chatInput.tagName.toLowerCase()}#${chatInput.id || '(no id)'}`,
         '- autocomplete ready.');
       return true;
@@ -1690,12 +1702,12 @@
       setTimeout(() => {
         if (!chatInput && emotes.size === 0 && !document.querySelector('iframe')) {
           if (pendingChildEmotes.length > 0) {
-            console.warn(
+            dwarn(
               '[Vaughn Emotes] Chat iframe detected its own picker but rendered no emote items. ' +
               'Copy the [Vaughn Emotes] DIAGNOSTICS output from the IFRAME console (devtools frame selector) here.'
             );
           } else {
-            console.warn('[Vaughn Emotes] No chat input or iframes found in this frame.');
+            dwarn('[Vaughn Emotes] No chat input or iframes found in this frame.');
           }
         }
       }, 8000);
@@ -1723,7 +1735,7 @@
           const before = emotes.size;
           storeEmotes(domList);
           if (emotes.size !== before) {
-            console.log(`[Vaughn Emotes] Merged ${emotes.size} emotes from DOM (picker detected; +${emotes.size - before}).`);
+            dlog(`[Vaughn Emotes] Merged ${emotes.size} emotes from DOM (picker detected; +${emotes.size - before}).`);
             maybeBuildDropdown();
             if (!isTopFrame()) postEmotesToParent(Array.from(emotes.values()));
           }
